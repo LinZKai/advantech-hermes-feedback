@@ -93,8 +93,17 @@ from plugins.platforms.telegram.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace, env_float, env_int
+from tools.feedback_callbacks import parse_feedback_callback
 from tools.feedback_storage import FeedbackStore, parse_callback_data
 from tools.universal_feedback import turn_key
+
+_FEEDBACK_REASON_LABELS = {
+    "incorrect": "答案不正確",
+    "incomplete": "資訊不完整",
+    "not_relevant": "與問題無關",
+    "unclear": "說明不清楚",
+    "other": "其他",
+}
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -4955,6 +4964,63 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def _authorize_universal_feedback_run(
+        self,
+        query,
+        run_id: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ):
+        """Shared fail-closed authorization for fb:h/u/r Universal callbacks.
+
+        Unlike the legacy fb:y/n path, owner (telegram_user_id) and message
+        binding (feedback_message_id) are mandatory here, not optional — a
+        missing value fails closed rather than being skipped. On success
+        returns the validated feedback_runs row; on failure it has already
+        answered the callback with a rejection and returns None.
+        """
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not caller_id:
+            await query.answer(text="This feedback prompt cannot be verified.")
+            return None
+        if query_chat_id is None:
+            await query.answer(text="This feedback prompt cannot be verified.")
+            return None
+        query_message = getattr(query, "message", None)
+        query_message_id = getattr(query_message, "message_id", None)
+        if query_message_id is None:
+            await query.answer(text="This feedback prompt cannot be verified.")
+            return None
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to answer this prompt.")
+            return None
+        store = self._feedback_store
+        if store is None:
+            await query.answer(text="Feedback is temporarily unavailable.")
+            return None
+        row = store.get(run_id)
+        if row is None or str(row["chat_id"]) != str(query_chat_id):
+            await query.answer(text="This feedback prompt is invalid.")
+            return None
+        owner_id = row["telegram_user_id"]
+        if owner_id in (None, "") or str(owner_id) != caller_id:
+            await query.answer(text="⛔ 只有原使用者可以提交這筆回饋。")
+            return None
+        stored_message_id = row["feedback_message_id"]
+        if stored_message_id in (None, "") or str(stored_message_id) != str(query_message_id):
+            await query.answer(text="This feedback prompt is invalid.")
+            return None
+        return row
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -4970,10 +5036,85 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
-        # --- Feedback callbacks (fb:y:run_id | fb:n:run_id) ---
+        # --- Feedback callbacks: Universal (fb:h/u/r) | legacy (fb:y/n) ---
         if data.startswith("fb:"):
+            universal = parse_feedback_callback(data)
+            if universal is not None:
+                run_id = universal.run_id
+                row = await self._authorize_universal_feedback_run(
+                    query,
+                    run_id,
+                    query_chat_id=query_chat_id,
+                    query_chat_type=query_chat_type,
+                    query_thread_id=query_thread_id,
+                    query_user_name=query_user_name,
+                )
+                if row is None:
+                    return
+                store = self._feedback_store
+
+                if universal.action == "h":
+                    accepted = store.submit_helpful(run_id, True)
+                    if not accepted:
+                        await query.answer(text="這筆回饋已收到。")
+                        return
+                    await query.answer(text="已收到，謝謝您的回饋！")
+                    try:
+                        await query.edit_message_text(
+                            text="感謝您的回饋！\n\n👍 有幫助", reply_markup=None
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                if universal.action == "u":
+                    if row["submitted_at"] is not None:
+                        await query.answer(text="這筆回饋已收到。")
+                        return
+                    await query.answer(text="請選擇原因。")
+                    try:
+                        reason_rows = [
+                            [InlineKeyboardButton(label, callback_data=f"fb:r:{run_id}:{code}")]
+                            for code, label in _FEEDBACK_REASON_LABELS.items()
+                        ]
+                        await query.edit_message_text(
+                            text="請選擇這則回答需要改善的原因：",
+                            reply_markup=InlineKeyboardMarkup(reason_rows),
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                if universal.action != "r":
+                    await query.answer(text="Invalid feedback data.")
+                    return
+
+                reason_code = universal.reason_code
+                accepted = store.submit_negative(run_id, reason_code)
+                if not accepted:
+                    await query.answer(text="這筆回饋已收到。")
+                    return
+                await query.answer(text="已收到，謝謝您的回饋！")
+                try:
+                    reason_label = _FEEDBACK_REASON_LABELS.get(reason_code, reason_code)
+                    await query.edit_message_text(
+                        text=f"感謝您的回饋！\n\n👎 需改善\n原因：{reason_label}",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                return
+
+            # --- Legacy fb:y:run_id | fb:n:run_id (resolved flow) ---
+            # parse_callback_data() still accepts h/u for its legacy tuple
+            # contract, but h/u are now owned exclusively by the Universal
+            # branch above (with mandatory owner/message-id binding) — a
+            # payload that failed the structured parser must not silently
+            # fall back to the weaker legacy path just because it happens to
+            # still match parse_callback_data()'s looser h/u/y/n shape.
             parsed = parse_callback_data(data)
-            if parsed is None:
+            legacy_action = data.split(":", 2)[1] if parsed is not None else None
+            if parsed is None or legacy_action not in {"y", "n"}:
                 await query.answer(text="Invalid feedback data.")
                 return
             caller_id = str(getattr(query.from_user, "id", ""))
@@ -5003,16 +5144,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 if original_user_id not in (None, "") and str(original_user_id) != caller_id:
                     await query.answer(text="⛔ 只有原使用者可以提交這筆回饋。")
                     return
-            is_universal = str(data).split(":", 2)[1] in {"h", "u"}
-            accepted = (store.submit_helpful(run_id, helpful) if is_universal else store.submit(run_id, helpful))
+            accepted = store.submit(run_id, helpful)
             if not accepted:
                 await query.answer(text="這筆回饋已收到。")
                 return
             await query.answer(text="已收到，謝謝您的回饋！")
             try:
-                label = "👍 有幫助" if helpful else "👎 需改善"
-                if not is_universal:
-                    label = "✅ 已解決" if helpful else "❌ 尚未解決"
+                label = "✅ 已解決" if helpful else "❌ 尚未解決"
                 await query.edit_message_text(text=f"感謝您的回饋！\n\n{label}", reply_markup=None)
             except Exception:
                 pass
