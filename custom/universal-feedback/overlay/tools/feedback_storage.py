@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tools.feedback_callbacks import is_valid_reason_code
 from tools.universal_feedback import safe_feedback_text
 
 DEFAULT_PATH = Path("/sandbox/.hermes/data/support_feedback.db")
@@ -95,4 +96,22 @@ class FeedbackStore:
         """Legacy /feedback_test compatibility; does not write helpful."""
         with self._connect() as db:
             cur = db.execute("UPDATE feedback_runs SET resolved=?, submitted_at=? WHERE run_id=? AND submitted_at IS NULL", (int(resolved), _now(), run_id))
+            return cur.rowcount == 1
+
+    def submit_negative(self, run_id: str, reason_code: str) -> bool:
+        """Atomically finalize a negative-feedback row with its reason.
+
+        Re-validates reason_code itself rather than trusting an
+        already-parsed callback, and requires helpful/reason_code/
+        submitted_at to all still be NULL so a prior positive or negative
+        submission for this run_id can never be overwritten.
+        """
+        if not is_valid_reason_code(reason_code):
+            return False
+        with self._connect() as db:
+            cur = db.execute(
+                "UPDATE feedback_runs SET helpful=0, reason_code=?, submitted_at=? "
+                "WHERE run_id=? AND helpful IS NULL AND reason_code IS NULL AND submitted_at IS NULL",
+                (reason_code, _now(), run_id),
+            )
             return cur.rowcount == 1

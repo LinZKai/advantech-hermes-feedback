@@ -615,6 +615,9 @@ COPY custom/universal-feedback/overlay/plugins/platforms/telegram/adapter.py \
 COPY custom/universal-feedback/overlay/tools/feedback_storage.py \
     /opt/hermes/tools/feedback_storage.py
 
+COPY custom/universal-feedback/overlay/tools/feedback_callbacks.py \
+    /opt/hermes/tools/feedback_callbacks.py
+
 COPY custom/universal-feedback/overlay/tools/universal_feedback.py \
     /opt/hermes/tools/universal_feedback.py
 
@@ -629,6 +632,7 @@ RUN set -eu; \
         /opt/hermes/gateway/platforms/base.py \
         /opt/hermes/plugins/platforms/telegram/adapter.py \
         /opt/hermes/tools/feedback_storage.py \
+        /opt/hermes/tools/feedback_callbacks.py \
         /opt/hermes/tools/universal_feedback.py \
         /opt/hermes/migrations/001_universal_feedback.sql; \
     /opt/hermes/.venv/bin/python -m py_compile \
@@ -636,6 +640,7 @@ RUN set -eu; \
         /opt/hermes/gateway/platforms/base.py \
         /opt/hermes/plugins/platforms/telegram/adapter.py \
         /opt/hermes/tools/feedback_storage.py \
+        /opt/hermes/tools/feedback_callbacks.py \
         /opt/hermes/tools/universal_feedback.py
 
 # END ADVANTECH UNIVERSAL FEEDBACK
