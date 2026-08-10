@@ -94,7 +94,7 @@ from plugins.platforms.telegram.telegram_network import (
 )
 from utils import atomic_replace, env_float, env_int
 from tools.feedback_callbacks import parse_feedback_callback
-from tools.feedback_storage import FeedbackStore, parse_callback_data
+from tools.feedback_storage import FeedbackStore, MAX_SUGGESTION_TEXT_LENGTH, parse_callback_data
 from tools.universal_feedback import turn_key
 
 _FEEDBACK_REASON_LABELS = {
@@ -5098,7 +5098,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 try:
                     reason_label = _FEEDBACK_REASON_LABELS.get(reason_code, reason_code)
                     await query.edit_message_text(
-                        text=f"感謝您的回饋！\n\n👎 需改善\n原因：{reason_label}",
+                        text=(
+                            f"感謝您的回饋！\n\n👎 需改善\n原因：{reason_label}\n\n"
+                            "可直接回覆此訊息補充建議（選填）。"
+                        ),
                         reply_markup=None,
                     )
                 except Exception:
@@ -7272,6 +7275,106 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    async def _try_handle_feedback_suggestion_reply(self, msg: Message) -> bool:
+        """Intercept a text reply to one of our own Universal Feedback prompts.
+
+        Returns True when this message has been fully consumed by the
+        feedback-suggestion flow — the caller must return immediately and
+        must not route it to ``_should_process_message`` / the normal agent
+        pipeline. Returns False when it is not a reply to a known Feedback
+        message (or required fields are missing), so the caller's existing
+        agent-dispatch flow proceeds completely unchanged.
+
+        This does not reuse ``_authorize_universal_feedback_run`` (that
+        helper answers a ``CallbackQuery`` on rejection; there is no
+        callback query here, only a plain ``Message``), but mirrors its
+        fail-closed shape: chat/owner/message binding is mandatory, not
+        optional, and every rejection path is decided before any storage
+        mutation or Telegram reply.
+        """
+        reply_to = getattr(msg, "reply_to_message", None)
+        if reply_to is None:
+            return False
+        reply_to_message_id = getattr(reply_to, "message_id", None)
+        chat = getattr(msg, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        user = getattr(msg, "from_user", None)
+        user_id = getattr(user, "id", None)
+        if reply_to_message_id is None or chat_id is None or user_id is None:
+            return False
+
+        store = self._feedback_store
+        if store is None:
+            return False
+        row = store.get_by_feedback_message_id(str(chat_id), str(reply_to_message_id))
+        if row is None:
+            return False
+
+        caller_id = str(user_id)
+        owner_id = row["telegram_user_id"]
+        row_message_id = row["feedback_message_id"]
+        if (
+            owner_id in (None, "")
+            or str(owner_id) != caller_id
+            or row_message_id in (None, "")
+            or str(row_message_id) != str(reply_to_message_id)
+            or str(row["chat_id"]) != str(chat_id)
+        ):
+            # Fail closed, silently — no reply, no hint of why, so a
+            # mismatched reply cannot be used to probe for row/authorization
+            # details. run_id only (never the reply text) is logged.
+            logger.warning(
+                "[%s] Feedback suggestion reply binding mismatch for run %s",
+                self.name,
+                row["run_id"],
+            )
+            return True
+
+        run_id = row["run_id"]
+
+        if row["helpful"] != 0 or row["submitted_at"] is None:
+            try:
+                await msg.reply_text("這則回饋尚未成立，暫不接受建議。")
+            except Exception:
+                pass
+            return True
+
+        if row["suggestion_text"] is not None:
+            try:
+                await msg.reply_text("這則回饋已收到過建議，無法再次修改。")
+            except Exception:
+                pass
+            return True
+
+        stripped = (msg.text or "").strip()
+        if not stripped:
+            try:
+                await msg.reply_text("請輸入有效的建議文字。")
+            except Exception:
+                pass
+            return True
+        if len(stripped) > MAX_SUGGESTION_TEXT_LENGTH:
+            try:
+                await msg.reply_text(f"建議內容請勿超過 {MAX_SUGGESTION_TEXT_LENGTH} 字。")
+            except Exception:
+                pass
+            return True
+
+        accepted = store.submit_suggestion(
+            run_id, str(chat_id), caller_id, str(reply_to_message_id), stripped
+        )
+        try:
+            if accepted:
+                await msg.reply_text("感謝您的建議！")
+            else:
+                # Race with a concurrent duplicate reply — same conservative
+                # message as the pre-check duplicate case above, no detail
+                # about which invariant failed.
+                await msg.reply_text("這則回饋已收到過建議，無法再次修改。")
+        except Exception:
+            pass
+        return True
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -7292,6 +7395,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "from_user", None), "id", None),
                 getattr(getattr(msg, "chat", None), "id", None),
             )
+            return
+        if await self._try_handle_feedback_suggestion_reply(msg):
             return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
