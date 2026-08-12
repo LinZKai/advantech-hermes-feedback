@@ -94,6 +94,7 @@ from plugins.platforms.telegram.telegram_network import (
 )
 from utils import atomic_replace, env_float, env_int
 from tools.feedback_callbacks import parse_feedback_callback
+from tools.feedback_mirror import mirror_negative_feedback, mirror_positive_feedback, mirror_suggestion
 from tools.feedback_storage import FeedbackStore, MAX_SUGGESTION_TEXT_LENGTH, parse_callback_data
 from tools.universal_feedback import turn_key
 
@@ -5058,6 +5059,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     if not accepted:
                         await query.answer(text="這筆回饋已收到。")
                         return
+                    # Phase 3B: mirror into v2 immediately once legacy
+                    # storage itself has succeeded -- "legacy success" is
+                    # the storage mutation above, not the Telegram UX
+                    # below, so a query.answer()/edit_message_text()
+                    # failure can never suppress an already-legal mirror
+                    # attempt. Independent try/except: a mirror failure
+                    # must equally never affect the Telegram UX that
+                    # follows. row["turn_key"] is the same turn_id Phase 3A
+                    # already persisted for this Turn (never guessed).
+                    try:
+                        mirror_positive_feedback(row["turn_key"])
+                    except Exception:
+                        logger.debug("[%s] v2 feedback mirror (positive) failed", self.name, exc_info=True)
                     await query.answer(text="已收到，謝謝您的回饋！")
                     try:
                         await query.edit_message_text(
@@ -5094,6 +5108,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not accepted:
                     await query.answer(text="這筆回饋已收到。")
                     return
+                # Phase 3B: mirror into v2 immediately once legacy storage
+                # itself has succeeded -- "legacy success" is the storage
+                # mutation above, not the Telegram UX below, so a
+                # query.answer()/edit_message_text() failure can never
+                # suppress an already-legal mirror attempt. Independent
+                # try/except: a mirror failure must equally never affect
+                # the Telegram UX that follows. Same reason_code the legacy
+                # submission just validated -- no separate taxonomy.
+                try:
+                    mirror_negative_feedback(row["turn_key"], reason_code)
+                except Exception:
+                    logger.debug("[%s] v2 feedback mirror (negative) failed", self.name, exc_info=True)
                 await query.answer(text="已收到，謝謝您的回饋！")
                 try:
                     reason_label = _FEEDBACK_REASON_LABELS.get(reason_code, reason_code)
@@ -7363,6 +7389,19 @@ class TelegramAdapter(BasePlatformAdapter):
         accepted = store.submit_suggestion(
             run_id, str(chat_id), caller_id, str(reply_to_message_id), stripped
         )
+        # Phase 3B: mirror into v2 immediately once legacy storage itself
+        # has succeeded -- "legacy success" is the storage mutation above,
+        # not the reply_text() UX below, so a Telegram send failure can
+        # never suppress an already-legal mirror attempt. Independent
+        # try/except: a mirror failure must equally never affect the
+        # Telegram UX that follows. Only when the legacy write itself
+        # succeeded (a race loss here must not create an orphan v2
+        # suggestion either).
+        if accepted:
+            try:
+                mirror_suggestion(row["turn_key"], stripped)
+            except Exception:
+                logger.debug("[%s] v2 feedback mirror (suggestion) failed", self.name, exc_info=True)
         try:
             if accepted:
                 await msg.reply_text("感謝您的建議！")

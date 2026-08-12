@@ -515,7 +515,7 @@ class ObserveAndPersistTurnTests(_StoreTestCase):
         self.assertIs(ok, True)
 
     def test_returns_false_never_none_when_store_unavailable(self):
-        # store=None falls through to the process-wide _get_store()
+        # store=None falls through to the process-wide get_store()
         # singleton, which may resolve successfully on a machine where the
         # default DB path happens to be writable -- force the "unavailable"
         # branch deterministically instead of relying on the real default
@@ -525,7 +525,7 @@ class ObserveAndPersistTurnTests(_StoreTestCase):
         import tools.retrieval_runtime as rr
 
         response = {"final_response": "answer", "messages": [], "history_offset": 0, "phase3a_boundary_trusted": True}
-        with mock.patch.object(rr, "_get_store", return_value=None):
+        with mock.patch.object(rr, "get_store", return_value=None):
             result = observe_and_persist_turn(
                 response,
                 session_id="sess-1", platform="telegram", platform_chat_id="chat-1",

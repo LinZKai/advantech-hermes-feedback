@@ -59,13 +59,18 @@ _store_singleton: FeedbackStoreV2 | None = None
 _store_init_failed = False
 
 
-def _get_store() -> FeedbackStoreV2 | None:
+def get_store() -> FeedbackStoreV2 | None:
     """Lazily construct the process-wide FeedbackStoreV2 singleton.
+
+    Shared by every gateway/adapter-side glue module that needs
+    FeedbackStoreV2 (tools.retrieval_runtime's own Phase 3A entry points,
+    and tools.feedback_mirror's Phase 3B ones) so the process never opens
+    more than one connection pool to the same DB file for this purpose.
 
     Caches an init failure (rather than retrying on every turn) so a
     broken DB path does not turn into repeated disk I/O and log noise on
     every message -- if this needs to change (e.g. hot config reload)
-    that is a later phase's concern, not Phase 3A's.
+    that is a later phase's concern.
     """
     global _store_singleton, _store_init_failed
     if _store_singleton is not None:
@@ -76,7 +81,7 @@ def _get_store() -> FeedbackStoreV2 | None:
         _store_singleton = FeedbackStoreV2()
     except Exception:
         _store_init_failed = True
-        logger.debug("Phase 3A FeedbackStoreV2 init failed", exc_info=True)
+        logger.debug("FeedbackStoreV2 init failed", exc_info=True)
         return None
     return _store_singleton
 
@@ -250,7 +255,7 @@ def observe_and_persist_turn(
     failure) -- never raises, never returns None.
     """
     try:
-        active_store = store if store is not None else _get_store()
+        active_store = store if store is not None else get_store()
         if active_store is None:
             return False
         observation = parse_turn_retrieval_observations(
@@ -344,7 +349,7 @@ def persist_turn_observation_context(
     never raises, never returns None.
     """
     try:
-        active_store = store if store is not None else _get_store()
+        active_store = store if store is not None else get_store()
         if active_store is None:
             return False
         observation = safe_dict_to_observation(context.get("observation") or {})
@@ -374,6 +379,7 @@ def persist_turn_observation_context(
 
 __all__ = [
     "DEFAULT_CASE_ASSIGNMENT_METHOD",
+    "get_store",
     "default_case_id",
     "get_or_create_default_case",
     "resolve_boundary_trust",
