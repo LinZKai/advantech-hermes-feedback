@@ -10932,6 +10932,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
+            # Phase 3A telemetry, non-streaming leg: agent_result still has
+            # messages/history_offset here, before it is reduced to a plain
+            # string below. Skipped if the streaming block in
+            # _run_agent_inner already attempted persistence for this turn
+            # (phase3a_turn_persistence_attempted True on the same dict,
+            # regardless of outcome -- no cross-path retry). Parse only;
+            # the actual persist happens once base.py knows the real
+            # delivered text_content and confirms delivery. Fully isolated.
+            try:
+                if isinstance(agent_result, dict) and not agent_result.get("phase3a_turn_persistence_attempted"):
+                    from tools.retrieval_runtime import build_turn_observation_context
+                    from tools.universal_feedback import turn_key as _phase3a_turn_key
+                    _phase3a_ctx = build_turn_observation_context(
+                        agent_result,
+                        session_id=session_entry.session_id,
+                        platform=str(getattr(source.platform, "value", source.platform) or ""),
+                        platform_chat_id=str(source.chat_id) if source.chat_id is not None else None,
+                        turn_id=_phase3a_turn_key(source.chat_id, getattr(event, "message_id", None)),
+                        platform_user_id=str(source.user_id) if source.user_id is not None else "",
+                        platform_user_message_id=(
+                            str(event.message_id) if getattr(event, "message_id", None) is not None else ""
+                        ),
+                    )
+                    if _phase3a_ctx is not None:
+                        event.metadata["phase3a_turn_context"] = _phase3a_ctx
+            except Exception:
+                logger.debug("Phase 3A retrieval observation (pre-send) failed", exc_info=True)
+
             response = agent_result.get("final_response") or ""
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
@@ -17787,6 +17815,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "history_offset": _effective_history_offset,
                     "compacted_in_place": _compacted_in_place,
                     "session_id": effective_session_id,
+                    # Phase 3A (tools/retrieval_runtime.resolve_boundary_trust):
+                    # explicit, source-computed verdict for whether
+                    # messages[history_offset:] is safe to treat as "this
+                    # Turn only" -- computed here, once, from the real
+                    # _session_was_split/_compacted_in_place local state
+                    # this branch already has, rather than reconstructed
+                    # later from possibly-missing fields. A response dict
+                    # that never sets this key (e.g. the inactivity-timeout
+                    # synthetic dict below) is untrusted by default.
+                    "phase3a_boundary_trusted": not (_session_was_split or _compacted_in_place),
                     "last_prompt_tokens": _last_prompt_toks,
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
@@ -17887,6 +17925,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
                 "compacted_in_place": _compacted_in_place,
+                # See the matching field on the early-return branch above.
+                "phase3a_boundary_trusted": not (_session_was_split or _compacted_in_place),
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
@@ -18345,6 +18385,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "tools": tools_holder[0] or [],
                     "history_offset": 0,
                     "failed": True,
+                    # The agent was interrupted mid-run: result_holder[0]
+                    # may be a partial/in-progress snapshot, not a
+                    # reliable "these messages belong to this Turn"
+                    # boundary. Explicitly untrusted (never omitted) --
+                    # see the matching field on the two normal-completion
+                    # return points above.
+                    "phase3a_boundary_trusted": False,
                 }
 
             # Track fallback model state: if the agent switched to a
@@ -18790,10 +18837,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from tools.universal_feedback import feedback_eligible, safe_feedback_text, claim_feedback_ownership
 
+        # Phase 3A telemetry: independent of the legacy hook below (never
+        # gated on feedback_eligible()/claim_feedback_ownership()/
+        # universal_feedback_handled -- a turn with no Feedback UI, or a
+        # failing legacy hook, must still reach v2). Gated on delivery
+        # confirmation only (already_sent, never set for a failed
+        # response). "attempted" blocks a retry from the non-streaming
+        # path below regardless of outcome; "persisted" is the helper's
+        # real success/failure. See tools.retrieval_runtime for the full
+        # policy; this try/except is the only failure-isolation boundary
+        # needed here, since the helper is itself fail-closed.
+        try:
+            if (
+                isinstance(response, dict)
+                and bool(response.get("already_sent"))
+                and not response.get("phase3a_turn_persistence_attempted")
+            ):
+                response["phase3a_turn_persistence_attempted"] = True
+                from tools.retrieval_runtime import observe_and_persist_turn
+                from tools.universal_feedback import turn_key as _phase3a_turn_key
+                response["phase3a_turn_persisted"] = observe_and_persist_turn(
+                    response,
+                    session_id=session_id,
+                    platform=str(getattr(source.platform, "value", source.platform) or ""),
+                    platform_chat_id=str(source.chat_id) if source.chat_id is not None else None,
+                    turn_id=_phase3a_turn_key(source.chat_id, event_message_id),
+                    platform_user_id=str(source.user_id) if source.user_id is not None else "",
+                    platform_user_message_id=str(event_message_id) if event_message_id is not None else "",
+                    platform_assistant_message_id=getattr(_sc, "message_id", None),
+                    question_text=message,
+                    feedback_eligible=feedback_eligible(
+                        platform=source.platform,
+                        text=message,
+                        message_type=message_type,
+                        response=response,
+                        stream_task_ok=(
+                            stream_task is not None
+                            and not stream_task.cancelled()
+                            and stream_task.done()
+                        ),
+                        final_content_delivered=bool(
+                            _sc is not None
+                            and getattr(_sc, "final_content_delivered", False)
+                        ),
+                    ),
+                )
+        except Exception:
+            logger.debug("Phase 3A retrieval observation failed", exc_info=True)
+
         # Universal message-level feedback hook: streaming final content has
         # completed and any transformed final edit above has succeeded. The
         # adapter owns persistence and UI delivery; this hook only runs for
         # Telegram streaming turns and never inspects answer prefixes.
+        # Independent of the Phase 3A block above -- neither this hook's
+        # success/failure nor whether it runs at all affects whether a v2
+        # Turn was already persisted above.
         if (
             isinstance(response, dict)
             and feedback_eligible(

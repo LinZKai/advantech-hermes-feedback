@@ -10,6 +10,20 @@ already points at, alongside the untouched legacy table.
 Phase 2 scope only: this module provides the schema and storage API. It is
 not wired into the gateway, the Telegram adapter, or any messages parser --
 callers (a later phase) are responsible for deciding what to write and when.
+
+Migration 003 (see ../migrations/003_retrieval_execution_statuses.sql,
+Phase 3A): widens retrieval_runs.execution_status to also allow 'blocked'
+and 'unparseable'. 002_feedback_schema_v2.sql itself is never edited to
+reflect this -- it stays byte-for-byte what Phase 2 commit 099abb5
+originally created, so migration history stays traceable. _SCHEMA_STATEMENTS
+below creates a brand-new database directly in the post-003 shape (a fresh
+CREATE TABLE IF NOT EXISTS is a no-op against an existing table regardless
+of its CHECK constraint, so this alone would silently fail to widen an
+*existing* v2 database); _migrate_schema() separately runs
+_upgrade_retrieval_runs_execution_statuses() to detect and rebuild an
+existing pre-003 retrieval_runs table in place, using SQLite's own
+documented 12-step ALTER TABLE recipe (SQLite has no ALTER TABLE ... DROP/
+ADD CONSTRAINT).
 """
 from __future__ import annotations
 
@@ -50,6 +64,14 @@ EXECUTION_STATUSES: tuple[str, ...] = (
     "invalid_response",
     "no_documents",
     "unknown",
+    # Added by migration 003 (tools/retrieval_observer.py, Phase 3A):
+    # "blocked" is a fully-readable outer-terminal signal (policy blocked
+    # the command before Foundry IQ's own script ever ran), paired with
+    # observation_status="complete". "unparseable" is a truncated/
+    # placeholder/malformed outer or inner result, paired with
+    # observation_status="partial".
+    "blocked",
+    "unparseable",
 )
 _EXECUTION_STATUS_SET = frozenset(EXECUTION_STATUSES)
 
@@ -145,9 +167,16 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         tool_call_id           TEXT,
 
         request_attempted      INTEGER CHECK (request_attempted IN (0, 1)),
+        -- Post-003 shape (see migration 003 / module docstring above): a
+        -- brand-new database is created directly with 'blocked' and
+        -- 'unparseable' already allowed. An *existing* pre-003 database
+        -- does not get this from CREATE TABLE IF NOT EXISTS alone (a
+        -- no-op against an existing table) -- see
+        -- _upgrade_retrieval_runs_execution_statuses().
         execution_status        TEXT NOT NULL CHECK (execution_status IN (
             'completed', 'failed', 'timed_out', 'http_error',
-            'network_error', 'invalid_response', 'no_documents', 'unknown'
+            'network_error', 'invalid_response', 'no_documents', 'unknown',
+            'blocked', 'unparseable'
         )),
         foundry_iq_ok            INTEGER CHECK (foundry_iq_ok IN (0, 1)),
         observation_status       TEXT NOT NULL
@@ -192,6 +221,76 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
 )
+
+# Migration 003 (see ../migrations/003_retrieval_execution_statuses.sql):
+# rebuild retrieval_runs in place to widen its execution_status CHECK
+# constraint to also allow 'blocked'/'unparseable', for a database whose
+# retrieval_runs table was already created under the original (Phase 2,
+# commit 099abb5) 002 migration. SQLite has no `ALTER TABLE ... DROP/ADD
+# CONSTRAINT`, so this is the standard 12-step ALTER TABLE recipe: create a
+# shadow table with the new constraint, copy every row unchanged, drop the
+# old table, rename the shadow table into place, recreate its indexes.
+# Column list is explicit (never `SELECT *`) so a future column addition to
+# one side can't silently misalign with the other. Never touches
+# feedback_runs, sessions, cases, turns, or feedback.
+_RETRIEVAL_RUNS_REBUILD_COLUMNS = (
+    "retrieval_id, turn_id, invocation_order, tool_call_id, "
+    "request_attempted, execution_status, foundry_iq_ok, "
+    "observation_status, observation_reason, "
+    "error_code, http_status, result_count, reference_count, "
+    "foundry_schema_version, created_at"
+)
+
+_RETRIEVAL_RUNS_REBUILD_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE retrieval_runs_new (
+        retrieval_id           TEXT PRIMARY KEY,
+        turn_id                TEXT NOT NULL REFERENCES turns(turn_id),
+        invocation_order       INTEGER NOT NULL,
+        tool_call_id           TEXT,
+
+        request_attempted      INTEGER CHECK (request_attempted IN (0, 1)),
+        execution_status        TEXT NOT NULL CHECK (execution_status IN (
+            'completed', 'failed', 'timed_out', 'http_error',
+            'network_error', 'invalid_response', 'no_documents', 'unknown',
+            'blocked', 'unparseable'
+        )),
+        foundry_iq_ok            INTEGER CHECK (foundry_iq_ok IN (0, 1)),
+        observation_status       TEXT NOT NULL
+            CHECK (observation_status IN ('complete', 'partial', 'unavailable')),
+        observation_reason       TEXT,
+
+        error_code                TEXT,
+        http_status                INTEGER CHECK (http_status IS NULL OR (http_status BETWEEN 100 AND 599)),
+        result_count                INTEGER,
+        reference_count               INTEGER,
+        foundry_schema_version          TEXT,
+
+        created_at TEXT NOT NULL,
+
+        UNIQUE (turn_id, invocation_order)
+    )
+    """,
+    f"INSERT INTO retrieval_runs_new ({_RETRIEVAL_RUNS_REBUILD_COLUMNS}) "
+    f"SELECT {_RETRIEVAL_RUNS_REBUILD_COLUMNS} FROM retrieval_runs",
+    "DROP TABLE retrieval_runs",
+    "ALTER TABLE retrieval_runs_new RENAME TO retrieval_runs",
+    "CREATE INDEX IF NOT EXISTS idx_retrieval_runs_turn ON retrieval_runs(turn_id)",
+)
+
+# A pre-003 retrieval_runs table's own CREATE TABLE text (recorded verbatim
+# in sqlite_master.sql) cannot contain either of these literals -- the
+# original 002 migration's CHECK constraint enumerates exactly the 8
+# pre-003 values. BOTH markers must be present for the table to count as
+# fully upgraded: checking only one (e.g. only 'blocked') would treat an
+# abnormal partial/hand-edited schema that has 'blocked' but not
+# 'unparseable' as already-complete and skip the rebuild, silently leaving
+# 'unparseable' inserts to fail their CHECK constraint forever. Detection
+# is on the live table's actual recorded DDL, never on a separately-
+# tracked "migrations applied" version number, so it stays correct even if
+# this module's own history of migrations is ever replayed out of order or
+# against a hand-edited database.
+_EXECUTION_STATUS_UPGRADE_MARKERS = ("'blocked'", "'unparseable'")
 
 
 def _now() -> str:
@@ -252,17 +351,107 @@ class FeedbackStoreV2:
         return db
 
     def _migrate_schema(self) -> None:
-        """Idempotently create the v2 tables/indexes.
+        """Idempotently create the v2 tables/indexes, then apply migration
+        003 (widen retrieval_runs.execution_status) if needed.
 
-        Every statement is CREATE ... IF NOT EXISTS, so re-running this
-        (e.g. on every process start, matching FeedbackStore's own
-        _migrate_schema convention) against a database that already has
-        these tables, or against one that only has the legacy 001 schema
-        applied, is always safe. Never touches feedback_runs.
+        Every statement in _SCHEMA_STATEMENTS is CREATE ... IF NOT EXISTS,
+        so re-running this (e.g. on every process start, matching
+        FeedbackStore's own _migrate_schema convention) against a database
+        that already has these tables, or against one that only has the
+        legacy 001 schema applied, is always safe. Never touches
+        feedback_runs.
+
+        On a brand-new database, _SCHEMA_STATEMENTS already creates
+        retrieval_runs directly in the post-003 shape, so the upgrade step
+        below is a no-op there; it only does real work against a database
+        whose retrieval_runs table was already created under the original
+        (pre-003) 002 migration.
         """
         with self._connect() as db:
             for statement in _SCHEMA_STATEMENTS:
                 db.execute(statement)
+        self._upgrade_retrieval_runs_execution_statuses()
+
+    def _retrieval_runs_needs_execution_status_upgrade(self, db: sqlite3.Connection) -> bool:
+        """Detect an existing pre-003 retrieval_runs table by inspecting
+        its own recorded CREATE TABLE text in sqlite_master -- never a
+        separately-tracked "migrations applied" version number, so this
+        stays correct even against a database whose migration history
+        this module did not itself apply. Returns False (nothing to do)
+        both when the table already has the widened constraint (BOTH
+        'blocked' and 'unparseable' present -- checking only one would
+        wrongly treat an abnormal partial schema as fully upgraded) AND
+        when the table does not exist yet at all (a fresh database,
+        already created in the post-003 shape by _SCHEMA_STATEMENTS
+        above)."""
+        row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='retrieval_runs'"
+        ).fetchone()
+        if row is None:
+            return False
+        sql_text = row[0] or ""
+        return not all(marker in sql_text for marker in _EXECUTION_STATUS_UPGRADE_MARKERS)
+
+    def _upgrade_retrieval_runs_execution_statuses(self) -> None:
+        """Migration 003 (see ../migrations/003_retrieval_execution_statuses.sql):
+        rebuild retrieval_runs in place so its execution_status CHECK
+        constraint also allows 'blocked'/'unparseable'.
+
+        Uses a dedicated connection with explicit BEGIN IMMEDIATE / COMMIT /
+        ROLLBACK (rather than self._connect()'s implicit-transaction
+        `with db:` convention used elsewhere in this class), because
+        `PRAGMA foreign_keys` can only be changed outside an open
+        transaction -- it must be turned off *before* BEGIN and back on
+        *after* COMMIT/ROLLBACK, which the implicit-transaction pattern
+        cannot express. Every retrieval_runs row is copied across
+        unchanged via an explicit column list (never `SELECT *`); indexes
+        are recreated by name after the rename since dropping a table also
+        drops its indexes. `PRAGMA foreign_key_check` is verified before
+        COMMIT; any failure at any step (including a RETRIEVAL_RUNS_new
+        table left over from a previous failed attempt -- IF NOT EXISTS on
+        its own CREATE TABLE statement -- see below) rolls back the whole
+        transaction, leaving the original retrieval_runs table and its
+        data completely untouched. Never touches feedback_runs, sessions,
+        cases, turns, or feedback.
+        """
+        db = sqlite3.connect(self.path)
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            if not self._retrieval_runs_needs_execution_status_upgrade(db):
+                return
+            db.execute("PRAGMA foreign_keys=OFF")
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    # DROP TABLE IF EXISTS guards a shadow table left over
+                    # from an earlier attempt that failed after creating it
+                    # but before this same transaction could complete (the
+                    # failed attempt's own ROLLBACK already undid the DROP/
+                    # RENAME/INSERT below, but a table created *outside* any
+                    # transaction would not roll back -- CREATE TABLE here
+                    # runs inside BEGIN IMMEDIATE, so in practice this is
+                    # defensive belt-and-suspenders, not a known gap).
+                    db.execute("DROP TABLE IF EXISTS retrieval_runs_new")
+                    for statement in _RETRIEVAL_RUNS_REBUILD_STATEMENTS:
+                        db.execute(statement)
+                    violations = db.execute(
+                        "PRAGMA foreign_key_check(retrieval_runs)"
+                    ).fetchall()
+                    if violations:
+                        raise sqlite3.IntegrityError(
+                            f"retrieval_runs rebuild left {len(violations)} "
+                            "foreign_key_check violation(s)"
+                        )
+                except Exception:
+                    db.execute("ROLLBACK")
+                    raise
+                else:
+                    db.execute("COMMIT")
+            finally:
+                db.execute("PRAGMA foreign_keys=ON")
+        finally:
+            db.close()
 
     # -- sessions -------------------------------------------------------
 
