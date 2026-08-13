@@ -17911,7 +17911,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if final_response:
                 try:
                     from tools.case_routing import parse_and_strip_prefix as _phase4_parse_and_strip_prefix
+                    from tools.case_routing import sanitize_case_routing_for_display as _phase4_sanitize_for_display
                     final_response, case_routing = _phase4_parse_and_strip_prefix(final_response)
+                    # Display safety is a SEPARATE, stricter contract from
+                    # the non-destructive parse above: parse_and_strip_prefix
+                    # leaves final_response UNCHANGED whenever the envelope
+                    # isn't fully trustworthy (malformed JSON, unsupported
+                    # version, oversized, unclosed) -- correct for the
+                    # routing/trust decision (case_routing, already captured
+                    # above), but wrong for what Telegram is allowed to show.
+                    # sanitize_case_routing_for_display re-examines the same
+                    # text structurally (delimiters only, no schema/size
+                    # trust check) so a malformed-but-delimited frame is
+                    # still hidden, and fails closed (empty string, handled
+                    # by _normalize_empty_agent_response below) when no
+                    # closing delimiter exists at all. See its docstring in
+                    # tools/case_routing.py for the full rationale. A no-op
+                    # on the already-clean text parse_and_strip_prefix
+                    # produced for a genuinely valid envelope.
+                    final_response = _phase4_sanitize_for_display(final_response)
                     result["final_response"] = final_response
                 except Exception:
                     logger.debug("Phase 4 routing envelope parse failed", exc_info=True)
