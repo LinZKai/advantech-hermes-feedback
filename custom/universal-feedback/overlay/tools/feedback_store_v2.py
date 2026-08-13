@@ -24,6 +24,16 @@ _upgrade_retrieval_runs_execution_statuses() to detect and rebuild an
 existing pre-003 retrieval_runs table in place, using SQLite's own
 documented 12-step ALTER TABLE recipe (SQLite has no ALTER TABLE ... DROP/
 ADD CONSTRAINT).
+
+Migration 004 (see ../migrations/004_case_analysis.sql, Phase 4.5 Stage A):
+adds a new, purely-additive `case_analysis` table -- one append-only row per
+analysis run for a Case (never updated in place; re-analysis is always a new
+row, so history is never lost). Unlike migration 003, this needs no rebuild
+step: CREATE TABLE IF NOT EXISTS is sufficient and idempotent for a table
+that never existed before, on both a brand-new database and an existing one
+already at the 002/003 shape. Stage A only adds the schema and query
+surface below -- no LLM call, no enrichment service, and no runner exist
+yet; those are later stages.
 """
 from __future__ import annotations
 
@@ -77,6 +87,25 @@ _EXECUTION_STATUS_SET = frozenset(EXECUTION_STATUSES)
 
 OBSERVATION_STATUSES: tuple[str, ...] = ("complete", "partial", "unavailable")
 _OBSERVATION_STATUS_SET = frozenset(OBSERVATION_STATUSES)
+
+# Phase 4.5 Stage A: case_analysis.diagnosis / case_analysis.product_source
+# fixed vocabularies -- kept in sync with the CHECK constraints in
+# _SCHEMA_STATEMENTS below, so create_case_analysis() can fail closed in
+# Python (matching submit_feedback()'s pre-validation convention) before
+# ever attempting the INSERT, rather than relying solely on the DB-level
+# CHECK to reject bad input.
+DIAGNOSIS_VALUES: tuple[str, ...] = (
+    "knowledge_gap",
+    "retrieval_issue",
+    "answer_quality_issue",
+    "workflow_tool_issue",
+    "unclear_or_other",
+    "no_issue_detected",
+)
+_DIAGNOSIS_VALUE_SET = frozenset(DIAGNOSIS_VALUES)
+
+PRODUCT_SOURCE_VALUES: tuple[str, ...] = ("explicit_user_text", "inference")
+_PRODUCT_SOURCE_VALUE_SET = frozenset(PRODUCT_SOURCE_VALUES)
 
 # Fixed, safe reason stored on turns.retrieval_observation_reason when a
 # retrieval-insert batch fails and is rolled back -- never the underlying
@@ -220,6 +249,58 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         )
     )
     """,
+    # Phase 4.5 Stage A: append-only analysis history for a Case. Never
+    # updated in place -- create_case_analysis() only ever INSERTs, and
+    # UNIQUE(case_id, analyzed_at) is the only uniqueness constraint (not
+    # UNIQUE(case_id) alone), so re-analysis is always a new row, never an
+    # overwrite of a prior one. source_evidence_watermark is NOT
+    # cases.updated_at (that column is only ever set once, at Case
+    # creation -- see get_case_evidence_watermark()'s docstring) -- it is
+    # the MAX(turns.created_at, feedback.submitted_at, retrieval_runs.
+    # created_at) this analysis run actually saw, recorded so a later run
+    # can tell whether new evidence has arrived since.
+    """
+    CREATE TABLE IF NOT EXISTS case_analysis (
+        analysis_id TEXT PRIMARY KEY,
+        case_id     TEXT NOT NULL REFERENCES cases(case_id),
+
+        case_title      TEXT,
+        issue_summary   TEXT,
+
+        diagnosis            TEXT NOT NULL CHECK (diagnosis IN (
+            'knowledge_gap', 'retrieval_issue', 'answer_quality_issue',
+            'workflow_tool_issue', 'unclear_or_other', 'no_issue_detected'
+        )),
+        diagnosis_confidence REAL,
+
+        product_model      TEXT,
+        product_source      TEXT CHECK (
+            product_source IN ('explicit_user_text', 'inference')
+            OR product_source IS NULL
+        ),
+        product_confidence  REAL,
+
+        evidence_json TEXT,
+
+        analysis_version TEXT NOT NULL,
+        analyzed_at      TEXT NOT NULL,
+
+        -- Not a foreign key or CHECK -- just a recorded TEXT timestamp,
+        -- same ISO-8601 (datetime.now(timezone.utc).isoformat()) shape as
+        -- every other *_at/*_watermark column in this module, so lexical
+        -- TEXT comparison ("<", ">", MAX()) matches chronological order.
+        source_evidence_watermark TEXT NOT NULL,
+
+        -- Prevents two rows for the same case at the exact same
+        -- analyzed_at (practically only reachable by a caller-supplied
+        -- duplicate, since this module's own _now() has microsecond
+        -- resolution); also what makes get_latest_case_analysis()'s
+        -- "ORDER BY analyzed_at DESC LIMIT 1" unambiguous for any one
+        -- case_id -- ties are structurally impossible per case.
+        UNIQUE (case_id, analyzed_at)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_case_analysis_case ON case_analysis(case_id)",
 )
 
 # Migration 003 (see ../migrations/003_retrieval_execution_statuses.sql):
@@ -823,6 +904,232 @@ class FeedbackStoreV2:
                 "SELECT * FROM feedback WHERE turn_id=?", (turn_id,)
             ).fetchone()
 
+    def list_feedback_for_case(self, case_id: str) -> list[sqlite3.Row]:
+        """Every Feedback row for every Turn in this Case, oldest first.
+
+        A Case-level counterpart to get_feedback() (single-turn) -- joins
+        through turns rather than requiring the caller to loop
+        list_turns_for_case() + get_feedback() per turn. feedback_id is a
+        secondary sort key purely to make row order fully deterministic
+        even on the (currently unreachable, since submitted_at has
+        microsecond resolution) chance of two rows sharing the same
+        submitted_at -- it carries no meaning of its own.
+        """
+        with self._connect() as db:
+            return db.execute(
+                """
+                SELECT feedback.*
+                FROM feedback
+                JOIN turns ON feedback.turn_id = turns.turn_id
+                WHERE turns.case_id = ?
+                ORDER BY feedback.submitted_at, feedback.feedback_id
+                """,
+                (case_id,),
+            ).fetchall()
+
+    # -- case analysis (Phase 4.5 Stage A) -------------------------------
+
+    def get_case_evidence_watermark(self, case_id: str) -> str | None:
+        """The latest timestamp across every piece of evidence this Case
+        currently has: MAX(turns.created_at, feedback.submitted_at,
+        retrieval_runs.created_at) for Turns belonging to this case_id.
+
+        Deliberately NOT cases.updated_at -- that column is set once, at
+        Case creation (FeedbackStoreV2.create_case()), and is never touched
+        by create_turn(), submit_feedback(), add_suggestion(), or
+        add_retrieval_runs() (verified: no code path anywhere issues
+        ``UPDATE cases``). Using it as a "Case evidence changed" watermark
+        would make every Case with more than one Turn look permanently
+        not-stale after its first Turn.
+
+        Implementation note: combines all three sources via UNION ALL
+        into one column, then applies the AGGREGATE MAX() over that column
+        -- never SQLite's scalar ``max(a, b, c)`` form, which returns NULL
+        if ANY argument is NULL (a Case with turns but no feedback yet, or
+        no retrieval evidence yet, would silently lose its real watermark).
+        Aggregate MAX() over a UNION ALL correctly ignores the branches
+        that contribute zero rows and returns NULL only when the whole
+        union is empty.
+
+        Returns None if the case has zero turns (create_case() does not
+        require an immediate turn -- a Case can theoretically exist with no
+        Turn yet if a caller creates one directly, or if turn persistence
+        failed after case persistence already committed) or does not
+        exist. Never raises on a missing/unknown case_id -- an empty result
+        set is a normal SQL outcome, not an error.
+        """
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT MAX(ts) AS watermark FROM (
+                    SELECT created_at AS ts FROM turns WHERE case_id = ?
+                    UNION ALL
+                    SELECT feedback.submitted_at AS ts
+                    FROM feedback JOIN turns ON feedback.turn_id = turns.turn_id
+                    WHERE turns.case_id = ?
+                    UNION ALL
+                    SELECT retrieval_runs.created_at AS ts
+                    FROM retrieval_runs JOIN turns ON retrieval_runs.turn_id = turns.turn_id
+                    WHERE turns.case_id = ?
+                )
+                """,
+                (case_id, case_id, case_id),
+            ).fetchone()
+        return row["watermark"] if row is not None else None
+
+    def get_latest_case_analysis(self, case_id: str) -> sqlite3.Row | None:
+        """The most recent case_analysis row for this case_id (by
+        analyzed_at), or None if this Case has never been analyzed.
+
+        Unambiguous by construction: UNIQUE(case_id, analyzed_at) means two
+        rows for the SAME case_id can never share the same analyzed_at, so
+        "ORDER BY analyzed_at DESC LIMIT 1" can never have a tie to break
+        for any one case_id (ties are only structurally possible ACROSS
+        different case_ids, which this query never compares against each
+        other).
+        """
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM case_analysis WHERE case_id=? ORDER BY analyzed_at DESC LIMIT 1",
+                (case_id,),
+            ).fetchone()
+
+    def create_case_analysis(
+        self,
+        analysis_id: str,
+        case_id: str,
+        *,
+        case_title: str | None,
+        issue_summary: str | None,
+        diagnosis: str,
+        diagnosis_confidence: float | None,
+        product_model: str | None,
+        product_source: str | None,
+        product_confidence: float | None,
+        evidence_json: str | None,
+        analysis_version: str,
+        analyzed_at: str,
+        source_evidence_watermark: str,
+    ) -> bool:
+        """Insert one analysis row for a Case. Append-only: this never
+        updates a prior row for the same case_id -- re-analysis is always a
+        new row (analyzed_at must differ from every prior row for this
+        case_id, enforced by UNIQUE(case_id, analyzed_at)), so analysis
+        history for a Case is never lost or silently overwritten.
+
+        Re-validates diagnosis/product_source in Python before attempting
+        the INSERT (fail closed, matching submit_feedback()'s convention),
+        even though the table's own CHECK constraints are the authoritative
+        backstop if this method is ever bypassed. Returns False, never
+        raises, for: an invalid diagnosis or product_source, an unknown
+        case_id (FK violation), or a duplicate (case_id, analyzed_at) pair
+        (UNIQUE violation) -- e.g. a caller retrying with the same
+        analyzed_at it already used.
+
+        Does not touch cases.title / cases.product_model -- deciding
+        whether/how an analysis result should update the Case's own
+        identity fields is deferred to a later stage (Human Override
+        policy is explicitly out of scope for Stage A).
+        """
+        if diagnosis not in _DIAGNOSIS_VALUE_SET:
+            return False
+        if product_source is not None and product_source not in _PRODUCT_SOURCE_VALUE_SET:
+            return False
+
+        with self._connect() as db:
+            try:
+                db.execute(
+                    """
+                    INSERT INTO case_analysis (
+                        analysis_id, case_id, case_title, issue_summary,
+                        diagnosis, diagnosis_confidence,
+                        product_model, product_source, product_confidence,
+                        evidence_json, analysis_version, analyzed_at,
+                        source_evidence_watermark
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(analysis_id), str(case_id), case_title, issue_summary,
+                        diagnosis, diagnosis_confidence,
+                        product_model, product_source, product_confidence,
+                        evidence_json, str(analysis_version), str(analyzed_at),
+                        str(source_evidence_watermark),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def list_cases_needing_analysis(
+        self, *, session_id: str | None = None, limit: int | None = None
+    ) -> list[sqlite3.Row]:
+        """Cases whose evidence has advanced past every analysis on
+        record for them (or that have never been analyzed at all), oldest
+        evidence first. Each returned row has ``case_id`` and
+        ``evidence_watermark`` columns.
+
+        Contract: a case_id is included when
+            no case_analysis row exists for it
+            OR
+            its current evidence watermark (§get_case_evidence_watermark)
+            > MAX(source_evidence_watermark) across every case_analysis
+              row ever recorded for it.
+        Using MAX(source_evidence_watermark) across ALL of a case's past
+        analyses (not just its most-recent-by-analyzed_at row) is
+        deliberate: source_evidence_watermark only grows across
+        successive runs for a real Case (each run computes it fresh from
+        current evidence, which never shrinks), so the two are equivalent
+        in every normal scenario, but this formulation stays correct
+        without depending on that assumption.
+
+        A Case with zero Turns (get_case_evidence_watermark() returns
+        None) is never included -- there is no evidence yet to analyze,
+        so "needs analysis" would be meaningless for it.
+
+        One query, no per-case follow-up lookups: the per-case evidence
+        watermark and the per-case latest-analysis-watermark are each
+        computed once via GROUP BY, then LEFT JOINed together.
+        ``session_id`` optionally scopes to one session's Cases (matching
+        list_cases_for_session's own scoping); ``limit`` bounds one
+        caller's batch, applied after ordering so the oldest-evidence
+        Cases are always favored first when a caller does not process the
+        whole backlog in one run.
+        """
+        query = """
+            SELECT ev.case_id AS case_id, ev.evidence_watermark AS evidence_watermark
+            FROM (
+                SELECT case_id, MAX(ts) AS evidence_watermark
+                FROM (
+                    SELECT case_id, created_at AS ts FROM turns
+                    UNION ALL
+                    SELECT turns.case_id AS case_id, feedback.submitted_at AS ts
+                    FROM feedback JOIN turns ON feedback.turn_id = turns.turn_id
+                    UNION ALL
+                    SELECT turns.case_id AS case_id, retrieval_runs.created_at AS ts
+                    FROM retrieval_runs JOIN turns ON retrieval_runs.turn_id = turns.turn_id
+                )
+                GROUP BY case_id
+            ) ev
+            LEFT JOIN (
+                SELECT case_id, MAX(source_evidence_watermark) AS latest_watermark
+                FROM case_analysis
+                GROUP BY case_id
+            ) la ON ev.case_id = la.case_id
+            WHERE (la.latest_watermark IS NULL OR ev.evidence_watermark > la.latest_watermark)
+        """
+        params: list[Any] = []
+        if session_id is not None:
+            query += " AND ev.case_id IN (SELECT case_id FROM cases WHERE session_id = ?)"
+            params.append(session_id)
+        query += " ORDER BY ev.evidence_watermark"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+
+        with self._connect() as db:
+            return db.execute(query, params).fetchall()
+
 
 __all__ = [
     "FeedbackStoreV2",
@@ -830,4 +1137,6 @@ __all__ = [
     "EXECUTION_STATUSES",
     "OBSERVATION_STATUSES",
     "REASON_CODES",
+    "DIAGNOSIS_VALUES",
+    "PRODUCT_SOURCE_VALUES",
 ]
