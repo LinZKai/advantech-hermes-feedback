@@ -34,8 +34,11 @@ matched to what each piece of Stage C wiring actually needs:
 from __future__ import annotations
 
 import gc
+import json
+import logging
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -536,6 +539,136 @@ class BuildPersistContextCaseRoutingRoundTripTests(_StoreTestCase):
         # override_routing (absent) + candidate_case_ids=frozenset() ->
         # first_turn, NOT the stashed "new" from context.
         self.assertEqual(turn["case_assignment_method"], CASE_ASSIGNMENT_METHOD_FIRST_TURN)
+
+
+# ---------------------------------------------------------------------------
+# 5. Non-streaming delivery leak-safety -- complements StreamEnvelopeFilterTests
+#    (section 2 above), which only proves the LIVE token-stream display
+#    filter hides a malformed envelope. The non-streaming delivery leg never
+#    goes through ``_StreamEnvelopeFilter`` at all: run.py's
+#    ``_handle_message_with_agent`` reads ``agent_result.get("final_response")``
+#    directly (~line 11114) and hands that text straight to base.py's
+#    ``_send_with_retry`` with no further case-routing-aware processing --
+#    base.py never imports ``tools.case_routing`` and never looks for the
+#    delimiters (see ``test_base_py_never_re_strips_case_routing`` below). So
+#    on this leg, the ONLY thing standing between a malformed model output
+#    and the Telegram user is the "authoritative parse" block in
+#    ``_run_agent_inner`` (run.py ~17910-17919) -- extracted here, verbatim,
+#    from the real deployed file, exec()'d in an isolated namespace (same
+#    technique ``_load_stream_envelope_filter_class`` uses above), and run
+#    against protocol-malformed input to prove what actually reaches
+#    delivery. This tests the REAL wiring, not a hand-copied paraphrase of
+#    ``strip_case_routing_prefix`` -- per the Stage C regression-gap
+#    request, a passing ``tools.case_routing`` unit test alone does not
+#    prove the delivery/wiring contract holds.
+# ---------------------------------------------------------------------------
+
+
+def _load_phase4_authoritative_strip_snippet() -> str:
+    text = _RUN_PY.read_text(encoding="utf-8")
+    start_marker = '            case_routing = None\n            if final_response:'
+    end_marker = '\n            _phase4_strip_final_assistant_message(result.get("messages"))'
+    start = text.index(start_marker)
+    end = text.index(end_marker, start)
+    return textwrap.dedent(text[start:end])
+
+
+_PHASE4_AUTHORITATIVE_STRIP_SNIPPET = _load_phase4_authoritative_strip_snippet()
+
+
+def _apply_authoritative_strip(raw_final_response: str):
+    """Run the REAL run.py wiring block (not a paraphrase) that produces the
+    ``final_response`` text every non-streaming delivery is built from.
+    Binds the same free variables (``result``, ``final_response``,
+    ``logger``) the snippet references in its native context in run.py, so
+    this executes unmodified production source, not a reimplementation of
+    it. Returns ``(final_response, case_routing)`` exactly like the real
+    block leaves them in its enclosing scope."""
+    namespace: dict = {
+        "result": {"final_response": raw_final_response},
+        "final_response": raw_final_response,
+        "logger": logging.getLogger("test_phase4_stage_c_wiring.authoritative_strip"),
+    }
+    exec(
+        compile(
+            _PHASE4_AUTHORITATIVE_STRIP_SNIPPET,
+            str(_RUN_PY) + ":phase4_authoritative_strip",
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["result"]["final_response"], namespace.get("case_routing")
+
+
+def _non_streaming_delivered_text(final_response_after_strip: str) -> str:
+    """The real extraction line from run.py's _handle_message_with_agent
+    (~line 11114): ``response = agent_result.get("final_response") or ""``
+    -- the exact text handed to base.py's ``_send_with_retry`` with no
+    further case-routing-aware processing on this leg (see
+    ``test_base_py_never_re_strips_case_routing``)."""
+    agent_result = {"final_response": final_response_after_strip}
+    return agent_result.get("final_response") or ""
+
+
+class NonStreamingEnvelopeLeakSafetyTests(_SourceTestCase):
+    def test_delivery_extraction_line_matches_real_source(self):
+        # Pins the exact line _non_streaming_delivered_text mirrors, so a
+        # future edit to this extraction in run.py invalidates the
+        # simulation above instead of silently drifting from it.
+        self.assertIn(
+            'response = agent_result.get("final_response") or ""',
+            self.run_py_text,
+        )
+
+    def test_base_py_never_re_strips_case_routing(self):
+        # Confirms the authoritative strip really is the ONLY thing between
+        # the model and the Telegram user on the non-streaming leg: the
+        # send path in base.py never imports tools.case_routing and never
+        # looks for the envelope delimiters.
+        self.assertNotIn("case_routing", self.base_py_text)
+        self.assertNotIn(CASE_ROUTING_OPEN_DELIM, self.base_py_text)
+
+    def test_valid_envelope_stripped_before_non_streaming_delivery(self):
+        raw = _valid_envelope_text(action="existing", case_id="case-a") + "the real answer"
+        stripped, routing = _apply_authoritative_strip(raw)
+        delivered = _non_streaming_delivered_text(stripped)
+        self.assertEqual(delivered, "the real answer")
+        self.assertNotIn(CASE_ROUTING_OPEN_DELIM, delivered)
+        self.assertEqual(routing.status, "valid")
+
+    def test_malformed_json_envelope_never_reaches_non_streaming_delivery(self):
+        raw = CASE_ROUTING_OPEN_DELIM + "{not valid json" + CASE_ROUTING_CLOSE_DELIM + "the real answer"
+        stripped, routing = _apply_authoritative_strip(raw)
+        delivered = _non_streaming_delivered_text(stripped)
+        self.assertNotIn(CASE_ROUTING_OPEN_DELIM, delivered)
+        self.assertNotIn("not valid json", delivered)
+
+    def test_incomplete_unclosed_envelope_never_reaches_non_streaming_delivery(self):
+        # The model's turn ends mid-envelope -- no closing delimiter ever
+        # arrives (e.g. truncated by a length limit or upstream error).
+        raw = CASE_ROUTING_OPEN_DELIM + '{"case_action":"existing"'
+        stripped, routing = _apply_authoritative_strip(raw)
+        delivered = _non_streaming_delivered_text(stripped)
+        self.assertNotIn(CASE_ROUTING_OPEN_DELIM, delivered)
+
+    def test_oversized_envelope_never_reaches_non_streaming_delivery(self):
+        padding = "x" * (MAX_ENVELOPE_PREFIX_BYTES + 500)
+        raw = CASE_ROUTING_OPEN_DELIM + padding + CASE_ROUTING_CLOSE_DELIM + "the real answer"
+        stripped, routing = _apply_authoritative_strip(raw)
+        delivered = _non_streaming_delivered_text(stripped)
+        self.assertNotIn(CASE_ROUTING_OPEN_DELIM, delivered)
+        self.assertNotIn("x" * 100, delivered)
+
+    def test_unsupported_routing_version_never_reaches_non_streaming_delivery(self):
+        body = json.dumps({
+            "case_action": "new", "case_id": None,
+            "confidence": 0.9, "routing_version": "case-router-v0",
+        })
+        raw = CASE_ROUTING_OPEN_DELIM + body + CASE_ROUTING_CLOSE_DELIM + "the real answer"
+        stripped, routing = _apply_authoritative_strip(raw)
+        delivered = _non_streaming_delivered_text(stripped)
+        self.assertNotIn(CASE_ROUTING_OPEN_DELIM, delivered)
+        self.assertNotIn("case_action", delivered)
 
 
 if __name__ == "__main__":

@@ -390,6 +390,65 @@ def strip_case_routing_prefix(content: str) -> str:
     return clean_text
 
 
+def sanitize_case_routing_for_display(text: str) -> str:
+    """Remove a Case Routing Control Envelope prefix for USER-VISIBLE
+    delivery -- a deliberately SEPARATE, stricter contract from
+    ``parse_and_strip_prefix``/``strip_case_routing_prefix``.
+
+    Those two functions only remove a prefix that is fully protocol-valid
+    (right JSON, right schema, right ``routing_version``, under
+    ``MAX_ENVELOPE_PREFIX_BYTES``); on anything else they are deliberately
+    non-destructive, because their job is to hand a caller a trustworthy
+    ``CaseRoutingResult`` for a ROUTING decision, and silently repairing or
+    guessing at malformed input would misrepresent an unverified value as
+    trustworthy (see the module docstring). That non-destructive choice is
+    correct for the routing/trust contract, but wrong for display: a model
+    that emits a broken, oversized, or unsupported-version control frame
+    must never have that raw frame shown to the end user just because it
+    failed a trust check that has nothing to do with display safety.
+
+    Whether the envelope is trustworthy for Case assignment is answered
+    separately, by ``parse_and_strip_prefix``/``parse_case_routing_
+    envelope`` -- a caller needing both facts (e.g. the gateway's
+    post-run_conversation cleanup) calls both functions on the same raw
+    text, once each, and uses each result for its own concern. This
+    function never looks at ``case_action``/``confidence``/
+    ``routing_version`` at all.
+
+    Rule: if ``text`` begins with the opening delimiter, strip through the
+    FIRST closing delimiter found -- structurally, regardless of whether
+    the JSON between them is valid, matches the required schema, names a
+    supported ``routing_version``, or fits within
+    ``MAX_ENVELOPE_PREFIX_BYTES``. Size/schema/version are trust concerns,
+    not display concerns: a malformed-but-delimited control frame is just
+    as much "not part of the answer" as a well-formed one. This mirrors
+    ``_StreamEnvelopeFilter`` in gateway/run.py, which also hides
+    everything between the delimiters purely structurally, without
+    checking JSON validity, for the live token stream.
+
+    If NO closing delimiter can be found at all (the response is truncated
+    mid-envelope, or the model never closes it), there is no safe way to
+    know where internal control metadata ends and the real answer begins.
+    Guessing would risk leaking a metadata fragment into the visible
+    answer, so this fails closed and returns ``""`` rather than the raw
+    text -- matching the streaming filter's oversized-without-close-
+    delimiter branch, which also discards its buffer instead of forwarding
+    it. Turning an empty result into a user-facing message is the
+    gateway's existing empty-response handling's job, not this function's.
+
+    ``text`` that does not start with the opening delimiter at all --
+    the common case of a normal answer with no envelope -- is returned
+    unchanged.
+    """
+    if not isinstance(text, str) or not text.startswith(CASE_ROUTING_OPEN_DELIM):
+        return text
+    remainder = text[len(CASE_ROUTING_OPEN_DELIM):]
+    close_idx = remainder.find(CASE_ROUTING_CLOSE_DELIM)
+    if close_idx == -1:
+        return ""
+    return remainder[close_idx + len(CASE_ROUTING_CLOSE_DELIM):]
+
+
 __all__ = [
     "ROUTING_VERSION",
     "DEFAULT_CONFIDENCE_THRESHOLD",
@@ -412,6 +471,7 @@ __all__ = [
     "validate_case_routing",
     "parse_and_strip_prefix",
     "strip_case_routing_prefix",
+    "sanitize_case_routing_for_display",
 ]
 
 

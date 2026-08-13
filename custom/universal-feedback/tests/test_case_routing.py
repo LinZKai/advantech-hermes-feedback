@@ -35,6 +35,7 @@ from tools.case_routing import (  # noqa: E402
     CaseRoutingResult,
     parse_and_strip_prefix,
     parse_case_routing_envelope,
+    sanitize_case_routing_for_display,
     strip_case_routing_prefix,
     validate_case_routing,
 )
@@ -512,6 +513,96 @@ class ParserNeverRaisesOnMalformedInputTests(unittest.TestCase):
             with self.subTest(text=text[:40]):
                 result = parse_case_routing_envelope(text)
                 self.assertIn(result.status, ("absent", "invalid"))
+
+
+class DisplaySanitizationTests(unittest.TestCase):
+    """sanitize_case_routing_for_display: a separate, stricter contract from
+    strip_case_routing_prefix/parse_and_strip_prefix. It answers "is this
+    safe to SHOW the user", not "is this routing metadata trustworthy" --
+    those two questions can and do have different answers for the same
+    malformed input (see the contrast tests at the bottom of this class)."""
+
+    def test_ordinary_answer_with_no_envelope_unchanged(self):
+        text = "沒有 envelope 的正常回答"
+        self.assertEqual(sanitize_case_routing_for_display(text), text)
+
+    def test_empty_string_unchanged(self):
+        self.assertEqual(sanitize_case_routing_for_display(""), "")
+
+    def test_valid_envelope_stripped(self):
+        text = _envelope(answer="這是正常答案", case_action="new")
+        self.assertEqual(sanitize_case_routing_for_display(text), "這是正常答案")
+
+    def test_malformed_json_with_close_delimiter_is_stripped(self):
+        # Delimiters present, JSON inside is broken -- unlike
+        # strip_case_routing_prefix, display sanitization does NOT preserve
+        # this: the control frame is still structurally identifiable and
+        # must never reach the user.
+        text = CASE_ROUTING_OPEN_DELIM + "{not valid json" + CASE_ROUTING_CLOSE_DELIM + "answer"
+        self.assertEqual(sanitize_case_routing_for_display(text), "answer")
+
+    def test_unsupported_routing_version_is_stripped(self):
+        text = _envelope(answer="answer", case_action="new", routing_version="case-router-v0")
+        self.assertEqual(sanitize_case_routing_for_display(text), "answer")
+
+    def test_unknown_case_action_is_stripped(self):
+        text = CASE_ROUTING_OPEN_DELIM + '{"case_action":"closed","case_id":null,"confidence":0.9,"routing_version":"' + ROUTING_VERSION + '"}' + CASE_ROUTING_CLOSE_DELIM + "answer"
+        self.assertEqual(sanitize_case_routing_for_display(text), "answer")
+
+    def test_oversized_envelope_with_eventual_close_is_still_stripped(self):
+        # MAX_ENVELOPE_PREFIX_BYTES is a trust/routing limit, not a display
+        # limit -- an oversized-but-delimited frame must still be hidden,
+        # not weakened into a size check here.
+        padding = "x" * (MAX_ENVELOPE_PREFIX_BYTES + 200)
+        text = CASE_ROUTING_OPEN_DELIM + padding + CASE_ROUTING_CLOSE_DELIM + "answer"
+        self.assertEqual(sanitize_case_routing_for_display(text), "answer")
+
+    def test_incomplete_unclosed_envelope_fails_closed_to_empty(self):
+        # No closing delimiter anywhere -- cannot safely tell where control
+        # metadata ends and the real answer begins. Must not guess, must
+        # not forward the raw prefix.
+        text = CASE_ROUTING_OPEN_DELIM + '{"case_action":"existing"'
+        self.assertEqual(sanitize_case_routing_for_display(text), "")
+
+    def test_oversized_with_no_close_at_all_fails_closed_to_empty(self):
+        padding = "x" * (MAX_ENVELOPE_PREFIX_BYTES + 200)
+        text = CASE_ROUTING_OPEN_DELIM + padding
+        self.assertEqual(sanitize_case_routing_for_display(text), "")
+
+    def test_marker_later_in_answer_is_not_touched(self):
+        # Only an ABSOLUTE PREFIX opening delimiter triggers sanitization --
+        # matches parse_case_routing_envelope's prefix-only rule.
+        text = "正常回答內容...\n" + CASE_ROUTING_OPEN_DELIM + _envelope_json(case_action="new") + CASE_ROUTING_CLOSE_DELIM
+        self.assertEqual(sanitize_case_routing_for_display(text), text)
+
+    def test_envelope_only_no_trailing_answer_strips_to_empty(self):
+        text = _envelope(answer="", case_action="new")
+        self.assertEqual(sanitize_case_routing_for_display(text), "")
+
+    def test_never_raises_on_malformed_input(self):
+        malformed_inputs = [
+            "",
+            None,
+            CASE_ROUTING_OPEN_DELIM,
+            CASE_ROUTING_OPEN_DELIM + CASE_ROUTING_CLOSE_DELIM,
+            CASE_ROUTING_OPEN_DELIM + "x" * 5000,
+        ]
+        for text in malformed_inputs:
+            with self.subTest(text=text):
+                sanitize_case_routing_for_display(text)  # must not raise
+
+    # -- Contrast with strip_case_routing_prefix: same malformed input,
+    #    deliberately different outcome, because the two functions answer
+    #    different questions (trust vs. display safety).
+    def test_differs_from_strip_case_routing_prefix_on_malformed_json(self):
+        text = CASE_ROUTING_OPEN_DELIM + "{not valid json" + CASE_ROUTING_CLOSE_DELIM + "answer"
+        self.assertEqual(strip_case_routing_prefix(text), text)  # non-destructive (trust contract)
+        self.assertEqual(sanitize_case_routing_for_display(text), "answer")  # stripped (display contract)
+
+    def test_differs_from_strip_case_routing_prefix_on_unclosed_envelope(self):
+        text = CASE_ROUTING_OPEN_DELIM + '{"case_action":"existing"'
+        self.assertEqual(strip_case_routing_prefix(text), text)  # non-destructive (trust contract)
+        self.assertEqual(sanitize_case_routing_for_display(text), "")  # fails closed (display contract)
 
 
 if __name__ == "__main__":
