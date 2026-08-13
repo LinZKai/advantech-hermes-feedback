@@ -409,6 +409,141 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+class _StreamEnvelopeFilter:
+    """Phase 4A Stage C: hides a Case Routing Control Envelope prefix from
+    the LIVE user-visible token stream.
+
+    Display-filtering ONLY -- this class is never the source of truth for
+    Case assignment (Phase 4A Stage C plan, sections 6-8). The actual
+    routing decision is derived separately, once ``run_conversation()``
+    returns, by re-parsing the authoritative ``result["final_response"]``
+    with ``tools.case_routing.parse_and_strip_prefix`` -- never from this
+    class's transient buffering state. Stream filtering and routing
+    acceptance are deliberately independent mechanisms.
+
+    Runtime evidence this design relies on (agent/chat_completion_helpers.py
+    and agent/conversation_loop.py in the Hermes base image; not modified
+    by this overlay):
+
+    * ``agent.stream_delta_callback`` has exactly one observable
+      completion-boundary signal: it receives ``None`` exactly when a
+      completion that had ``tool_calls`` just finished streaming, right
+      before tool execution begins (conversation_loop.py ~4525-4529 and
+      the guardrail-halt path ~4550-4551) -- there is no
+      completion_started/completion_finished callback pair. This class
+      resets on that ``None`` and only on that ``None``.
+    * Normal text deltas can ALSO reach this callback mid-tool-call-
+      completion when a completion mixes content with tool_calls
+      (chat_completion_helpers.py ~2138-2141, the "suppressed content
+      still routed through stream_delta_callback for reasoning-tag
+      extraction" branch) -- so an intermediate completion's stream is
+      not guaranteed to be envelope-free either. This class filters
+      EVERY completion's stream uniformly, not just the final one.
+
+    Because the final completion is never followed by a ``None`` (the
+    turn just ends), whatever text streams after the LAST ``None`` reset
+    is not itself trusted as "the final completion's envelope" -- Stage C
+    never reads this class's internal state for that decision at all.
+    """
+
+    _WAITING = "waiting"
+    _BUFFERING = "buffering"
+    _NORMAL = "normal"
+
+    def __init__(self, forward) -> None:
+        self._forward = forward
+        self._mode = self._WAITING
+        self._buf = ""
+
+    def feed(self, text) -> None:
+        if text is None:
+            # Proven end of a tool-call completion -- see class docstring.
+            # Discard anything buffered so far (it cannot have come from a
+            # final non-tool completion) and reset for the next
+            # completion's stream. Pass the sentinel through unchanged --
+            # it is meaningful to the underlying stream consumer
+            # (segment/flush signal), independent of envelope filtering.
+            self._mode = self._WAITING
+            self._buf = ""
+            self._forward(None)
+            return
+
+        if self._mode == self._NORMAL:
+            self._forward(text)
+            return
+
+        from tools.case_routing import CASE_ROUTING_CLOSE_DELIM, CASE_ROUTING_OPEN_DELIM, MAX_ENVELOPE_PREFIX_BYTES
+
+        self._buf += text
+
+        if self._mode == self._WAITING:
+            common = min(len(self._buf), len(CASE_ROUTING_OPEN_DELIM))
+            if self._buf[:common] != CASE_ROUTING_OPEN_DELIM[:common]:
+                # Diverged -- definitely not an envelope. Flush everything
+                # buffered so far immediately (no need to wait for the
+                # full 14-character prefix) and stay pass-through for the
+                # rest of this completion's stream.
+                leftover, self._buf = self._buf, ""
+                self._mode = self._NORMAL
+                if leftover:
+                    self._forward(leftover)
+                return
+            if len(self._buf) < len(CASE_ROUTING_OPEN_DELIM):
+                return  # still an ambiguous partial match -- keep buffering
+            self._mode = self._BUFFERING
+
+        # self._mode == self._BUFFERING: opening delimiter confirmed,
+        # searching for the closing delimiter.
+        close_idx = self._buf.find(CASE_ROUTING_CLOSE_DELIM, len(CASE_ROUTING_OPEN_DELIM))
+        if close_idx == -1:
+            if len(self._buf.encode("utf-8")) > MAX_ENVELOPE_PREFIX_BYTES:
+                # Oversized -- give up without ever leaking the buffered
+                # control frame. Anything from here on in this completion
+                # streams normally.
+                self._buf = ""
+                self._mode = self._NORMAL
+            return
+
+        remainder = self._buf[close_idx + len(CASE_ROUTING_CLOSE_DELIM):]
+        self._buf = ""
+        self._mode = self._NORMAL
+        if remainder:
+            self._forward(remainder)
+
+
+def _phase4_strip_final_assistant_message(messages: Any) -> None:
+    """Phase 4A Stage C: strip a Case Routing Control Envelope prefix from
+    the CURRENT turn's final assistant message only, in place.
+
+    Never scans earlier history, never touches user/tool messages, never
+    rewrites anything when the prefix is malformed/incomplete (delegates
+    entirely to ``tools.case_routing.strip_case_routing_prefix``, which is
+    itself non-destructive on invalid input). ``messages[-1]`` is exactly
+    the current turn's final assistant message here: ``messages`` is
+    ``conversation_history`` followed by the messages this turn produced,
+    and per base Hermes' own loop semantics the last message can only be
+    the terminal, non-tool-call assistant turn (the turn only ends by
+    reaching that branch). This does NOT clean the Hermes-internal
+    session/state.db copy of this message written before
+    run_conversation() returned — see the Phase 4A Stage C report's
+    "Known Limitation" section; that would require modifying base Hermes
+    agent/*.py, which this overlay deliberately never does.
+    """
+    if not isinstance(messages, list) or not messages:
+        return
+    last = messages[-1]
+    if not isinstance(last, dict) or last.get("role") != "assistant":
+        return
+    content = last.get("content")
+    if not isinstance(content, str):
+        return
+    try:
+        from tools.case_routing import strip_case_routing_prefix
+        last["content"] = strip_case_routing_prefix(content)
+    except Exception:
+        logger.debug("Phase 4 result[messages] cleanup failed", exc_info=True)
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -10954,6 +11089,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         platform_user_message_id=(
                             str(event.message_id) if getattr(event, "message_id", None) is not None else ""
                         ),
+                        # Phase 4A Stage C: candidate context + the
+                        # already-parsed routing decision, both resolved
+                        # earlier in run_sync() and carried through on
+                        # agent_result — stashed here (case_routing as a
+                        # JSON-safe dict) so base.py's later persist_turn_
+                        # observation_context() call can read them back
+                        # without re-parsing anything (plan section 9).
+                        candidate_case_ids=(
+                            frozenset(agent_result["phase4_candidate_case_ids"])
+                            if agent_result.get("phase4_candidate_case_ids") is not None
+                            else None
+                        ),
+                        candidate_context_unavailable=bool(
+                            agent_result.get("phase4_candidate_context_unavailable", False)
+                        ),
+                        case_routing=agent_result.get("phase4_case_routing"),
                     )
                     if _phase3a_ctx is not None:
                         event.metadata["phase3a_turn_context"] = _phase3a_ctx
@@ -16814,6 +16965,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
+            # Phase 4A Stage C: load this session's candidate Cases once,
+            # before inference, and — only when at least one is confirmed
+            # to exist — append the routing contract to the ephemeral
+            # prompt. candidate_case_ids stays a frozenset (never None)
+            # here: None is reserved by retrieval_runtime.
+            # persist_turn_and_retrieval for "no Phase 4 context supplied
+            # at all" (legacy-caller compatibility). candidate_context_
+            # unavailable is a separate, explicit flag so a failed lookup
+            # is never mistaken for a confirmed-empty first turn (Phase 4A
+            # Stage C plan section 3/16). A lookup failure never blocks
+            # the answer and never injects a routing prompt — the model
+            # is simply not asked to route this turn.
+            _phase4_candidate_cases: list = []
+            _phase4_candidate_context_unavailable = False
+            try:
+                from tools.retrieval_runtime import build_case_routing_prompt, load_candidate_cases
+                _phase4_candidate_cases, _phase4_candidate_context_unavailable = load_candidate_cases(session_id)
+            except Exception:
+                logger.debug("Phase 4 candidate case loading failed", exc_info=True)
+                _phase4_candidate_cases, _phase4_candidate_context_unavailable = [], True
+            candidate_case_ids = frozenset(c["case_id"] for c in _phase4_candidate_cases)
+            if _phase4_candidate_cases and not _phase4_candidate_context_unavailable:
+                combined_ephemeral = (
+                    combined_ephemeral + "\n\n" + build_case_routing_prompt(_phase4_candidate_cases)
+                ).strip()
+
             max_iterations = _current_max_iterations()
 
             try:
@@ -16925,9 +17102,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             run_still_current=_run_still_current,
                         )
                         if _want_stream_deltas:
+                            # Phase 4A Stage C: hide any Case Routing
+                            # Control Envelope prefix from the live
+                            # stream. Display-filtering only — see
+                            # _StreamEnvelopeFilter's class docstring for
+                            # why routing ACCEPTANCE never reads this
+                            # filter's state.
+                            _phase4_stream_filter = _StreamEnvelopeFilter(_stream_consumer.on_delta)
+
                             def _stream_delta_cb(text: str) -> None:
                                 if _run_still_current():
-                                    _stream_consumer.on_delta(text)
+                                    _phase4_stream_filter.feed(text)
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
@@ -17709,6 +17894,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
 
+            # Phase 4A Stage C: the ONLY authoritative source for Case
+            # routing acceptance is a fresh parse of the real, complete
+            # final_response run_conversation() just returned — never the
+            # streaming filter's transient buffering state (plan section
+            # 7/8). This is safe as "final, non-tool-call answer" by
+            # construction: base Hermes only ever sets final_response
+            # from the branch with no tool_calls (conversation_loop.py),
+            # so intermediate tool-call assistant messages can never reach
+            # here. Runs unconditionally (cheap, a no-op when absent) so
+            # every downstream consumer of final_response — Telegram
+            # delivery, turns.answer_text, maybe_auto_title,
+            # result["messages"] — sees the same clean text from exactly
+            # one parse (plan section 9: no duplicate parsing).
+            case_routing = None
+            if final_response:
+                try:
+                    from tools.case_routing import parse_and_strip_prefix as _phase4_parse_and_strip_prefix
+                    final_response, case_routing = _phase4_parse_and_strip_prefix(final_response)
+                    result["final_response"] = final_response
+                except Exception:
+                    logger.debug("Phase 4 routing envelope parse failed", exc_info=True)
+                    case_routing = None
+            _phase4_strip_final_assistant_message(result.get("messages"))
+
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
             _input_toks = 0
@@ -17830,8 +18039,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    # Phase 4A Stage C: carried through to
+                    # _handle_message_with_agent / the streaming
+                    # persistence block below (tools.retrieval_runtime
+                    # accepts candidate_case_ids/case_routing/
+                    # candidate_context_unavailable directly — see plan
+                    # section 13/14). case_routing is None here since
+                    # this branch only runs when final_response ended up
+                    # empty (nothing to route).
+                    "phase4_case_routing": case_routing,
+                    "phase4_candidate_case_ids": sorted(candidate_case_ids),
+                    "phase4_candidate_context_unavailable": _phase4_candidate_context_unavailable,
                 }
-            
+
             # Scan tool results for MEDIA:<path> tags that need to be delivered
             # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
             # in its JSON response, but the model's final text reply usually
@@ -17940,6 +18160,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # self-persisted (it didn't — see codex_runtime.py).  Default
                 # True preserves the skip-db behaviour for the standard runtime.
                 "agent_persisted": (result_holder[0].get("agent_persisted", True) if result_holder[0] else True),
+                # Phase 4A Stage C: the authoritative routing decision
+                # (parsed once, above, from the real final_response) plus
+                # the candidate context it was resolved against — carried
+                # through to _handle_message_with_agent's non-streaming
+                # context builder and to the streaming persistence block
+                # below. See tools.retrieval_runtime for what each value
+                # means (None/frozenset()/non-empty).
+                "phase4_case_routing": case_routing,
+                "phase4_candidate_case_ids": sorted(candidate_case_ids),
+                "phase4_candidate_context_unavailable": _phase4_candidate_context_unavailable,
             }
         
         # Start progress message sender if enabled. Gate on needs_progress_queue
@@ -18880,6 +19110,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _sc is not None
                             and getattr(_sc, "final_content_delivered", False)
                         ),
+                    ),
+                    # Phase 4A Stage C: the routing decision + candidate
+                    # context resolved earlier in run_sync(), carried
+                    # through on the same response dict — never
+                    # re-decided or re-parsed here (plan section 13:
+                    # assignment policy stays in retrieval_runtime).
+                    case_routing=response.get("phase4_case_routing"),
+                    candidate_case_ids=(
+                        frozenset(response["phase4_candidate_case_ids"])
+                        if response.get("phase4_candidate_case_ids") is not None
+                        else None
+                    ),
+                    candidate_context_unavailable=bool(
+                        response.get("phase4_candidate_context_unavailable", False)
                     ),
                 )
         except Exception:
