@@ -5011,9 +5011,48 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+
+                    # Phase 3A telemetry, non-streaming leg: independent of
+                    # the legacy hook below (never gated on
+                    # feedback_eligible()/claim_feedback_ownership()/
+                    # universal_feedback_handled). Gated on delivery
+                    # confirmation (result.success) only. Uses the context
+                    # run.py's _handle_message_with_agent parsed earlier
+                    # (before media/image extraction could change the
+                    # answer text) and stashed on event.metadata -- a
+                    # missing context means the streaming leg already
+                    # attempted this turn (see run.py), or the parse step
+                    # failed closed; either way this is a normal no-op.
+                    try:
+                        _phase3a_ctx = (
+                            event.metadata.get("phase3a_turn_context")
+                            if isinstance(getattr(event, "metadata", None), dict)
+                            else None
+                        )
+                        if _phase3a_ctx is not None and bool(result.success):
+                            from tools.retrieval_runtime import persist_turn_observation_context
+                            from tools.universal_feedback import feedback_eligible as _phase3a_feedback_eligible
+                            persist_turn_observation_context(
+                                _phase3a_ctx,
+                                platform_assistant_message_id=result.message_id,
+                                question_text=event.text,
+                                answer_text=text_content,
+                                feedback_eligible=_phase3a_feedback_eligible(
+                                    platform=self.platform,
+                                    text=event.text,
+                                    message_type=getattr(event, "message_type", None),
+                                    response={"final_response": text_content},
+                                    stream_task_ok=bool(result.success),
+                                    final_content_delivered=bool(result.success),
+                                ),
+                            )
+                    except Exception:
+                        logger.debug("[%s] Phase 3A retrieval persistence failed", self.name, exc_info=True)
+
                     # Universal feedback is owned by this normal-send path
                     # only when the response was not already handled by the
-                    # streaming path. The policy helper is shared with run.py.
+                    # streaming path. The policy helper is shared with
+                    # run.py. Independent of the Phase 3A block above.
                     from tools.universal_feedback import feedback_eligible, safe_feedback_text, claim_feedback_ownership
                     _universal_feedback_handled = bool(
                         getattr(event, "universal_feedback_handled", False)

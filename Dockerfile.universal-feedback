@@ -621,10 +621,31 @@ COPY custom/universal-feedback/overlay/tools/feedback_callbacks.py \
 COPY custom/universal-feedback/overlay/tools/universal_feedback.py \
     /opt/hermes/tools/universal_feedback.py
 
+COPY custom/universal-feedback/overlay/tools/feedback_store_v2.py \
+    /opt/hermes/tools/feedback_store_v2.py
+
+COPY custom/universal-feedback/overlay/tools/retrieval_observer.py \
+    /opt/hermes/tools/retrieval_observer.py
+
+COPY custom/universal-feedback/overlay/tools/retrieval_runtime.py \
+    /opt/hermes/tools/retrieval_runtime.py
+
+COPY custom/universal-feedback/overlay/tools/case_routing.py \
+    /opt/hermes/tools/case_routing.py
+
+COPY custom/universal-feedback/overlay/tools/feedback_mirror.py \
+    /opt/hermes/tools/feedback_mirror.py
+
 RUN mkdir -p /opt/hermes/migrations
 
 COPY custom/universal-feedback/overlay/migrations/001_universal_feedback.sql \
     /opt/hermes/migrations/001_universal_feedback.sql
+
+COPY custom/universal-feedback/overlay/migrations/002_feedback_schema_v2.sql \
+    /opt/hermes/migrations/002_feedback_schema_v2.sql
+
+COPY custom/universal-feedback/overlay/migrations/003_retrieval_execution_statuses.sql \
+    /opt/hermes/migrations/003_retrieval_execution_statuses.sql
 
 RUN set -eu; \
     chmod 0644 \
@@ -634,14 +655,28 @@ RUN set -eu; \
         /opt/hermes/tools/feedback_storage.py \
         /opt/hermes/tools/feedback_callbacks.py \
         /opt/hermes/tools/universal_feedback.py \
-        /opt/hermes/migrations/001_universal_feedback.sql; \
+        /opt/hermes/tools/feedback_store_v2.py \
+        /opt/hermes/tools/retrieval_observer.py \
+        /opt/hermes/tools/retrieval_runtime.py \
+        /opt/hermes/tools/case_routing.py \
+        /opt/hermes/tools/feedback_mirror.py \
+        /opt/hermes/migrations/001_universal_feedback.sql \
+        /opt/hermes/migrations/002_feedback_schema_v2.sql \
+        /opt/hermes/migrations/003_retrieval_execution_statuses.sql; \
     /opt/hermes/.venv/bin/python -m py_compile \
         /opt/hermes/gateway/run.py \
         /opt/hermes/gateway/platforms/base.py \
         /opt/hermes/plugins/platforms/telegram/adapter.py \
         /opt/hermes/tools/feedback_storage.py \
         /opt/hermes/tools/feedback_callbacks.py \
-        /opt/hermes/tools/universal_feedback.py
+        /opt/hermes/tools/universal_feedback.py \
+        /opt/hermes/tools/feedback_store_v2.py \
+        /opt/hermes/tools/retrieval_observer.py \
+        /opt/hermes/tools/retrieval_runtime.py \
+        /opt/hermes/tools/case_routing.py \
+        /opt/hermes/tools/feedback_mirror.py; \
+    /opt/hermes/.venv/bin/python -c \
+        'import tools.feedback_store_v2, tools.retrieval_observer, tools.retrieval_runtime, tools.case_routing, tools.feedback_mirror'
 
 # END ADVANTECH UNIVERSAL FEEDBACK
 

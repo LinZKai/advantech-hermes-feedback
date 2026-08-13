@@ -6,10 +6,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from tools.feedback_callbacks import is_valid_reason_code
+from tools.feedback_callbacks import REASON_CODES, is_valid_reason_code
 from tools.universal_feedback import safe_feedback_text
 
 DEFAULT_PATH = Path("/sandbox/.hermes/data/support_feedback.db")
+MAX_SUGGESTION_TEXT_LENGTH = 1000
+_REASON_CODE_PLACEHOLDERS = ",".join("?" for _ in REASON_CODES)
 BASE_COLUMNS = {
     "run_id": "TEXT PRIMARY KEY", "chat_id": "TEXT NOT NULL", "resolved": "INTEGER",
     "created_at": "TEXT NOT NULL", "submitted_at": "TEXT",
@@ -82,6 +84,25 @@ class FeedbackStore:
         with self._connect() as db:
             return db.execute("SELECT * FROM feedback_runs WHERE turn_key = ?", (key,)).fetchone()
 
+    def get_by_feedback_message_id(self, chat_id: str, feedback_message_id: str):
+        """Look up the row for a (chat_id, feedback_message_id) pair.
+
+        Telegram message_id values are unique only within a single chat, so
+        feedback_message_id alone is not a safe lookup key — both fields are
+        required together. No DB constraint currently enforces uniqueness on
+        this pair, so if more than one row somehow matches, fail closed and
+        return None rather than arbitrarily picking one: an ambiguous
+        binding must never be treated as a valid authorization target.
+        """
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM feedback_runs WHERE chat_id = ? AND feedback_message_id = ?",
+                (str(chat_id), str(feedback_message_id)),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        return rows[0]
+
     def mark_send(self, run_id: str, *, status: str, feedback_message_id: str | None = None, assistant_message_id: str | None = None, ui_mode: str | None = None) -> bool:
         with self._connect() as db:
             cur = db.execute("UPDATE feedback_runs SET feedback_send_status=?, feedback_message_id=?, assistant_message_id=?, feedback_ui_mode=? WHERE run_id=?", (status, feedback_message_id, assistant_message_id, ui_mode, run_id))
@@ -113,5 +134,46 @@ class FeedbackStore:
                 "UPDATE feedback_runs SET helpful=0, reason_code=?, submitted_at=? "
                 "WHERE run_id=? AND helpful IS NULL AND reason_code IS NULL AND submitted_at IS NULL",
                 (reason_code, _now(), run_id),
+            )
+            return cur.rowcount == 1
+
+    def submit_suggestion(
+        self,
+        run_id: str,
+        chat_id: str,
+        telegram_user_id: str,
+        feedback_message_id: str,
+        suggestion_text: str,
+    ) -> bool:
+        """Atomically attach an optional suggestion to an already-finalized
+        negative-feedback row.
+
+        Re-validates the full chat/owner/message binding and eligibility
+        (helpful=0, legal reason_code, already submitted) inside the same
+        atomic UPDATE rather than trusting the caller's own authorization
+        pass, and requires suggestion_text to still be NULL so a prior
+        suggestion can never be overwritten. Rejects non-string, blank, or
+        over-length input outright — it is never silently truncated.
+        """
+        if not isinstance(suggestion_text, str):
+            return False
+        text = suggestion_text.strip()
+        if not text or len(text) > MAX_SUGGESTION_TEXT_LENGTH:
+            return False
+        text = safe_feedback_text(text)
+        with self._connect() as db:
+            cur = db.execute(
+                "UPDATE feedback_runs SET suggestion_text=? "
+                "WHERE run_id=? AND chat_id=? AND telegram_user_id=? AND feedback_message_id=? "
+                f"AND helpful=0 AND reason_code IN ({_REASON_CODE_PLACEHOLDERS}) "
+                "AND submitted_at IS NOT NULL AND suggestion_text IS NULL",
+                (
+                    text,
+                    str(run_id),
+                    str(chat_id),
+                    str(telegram_user_id),
+                    str(feedback_message_id),
+                    *REASON_CODES,
+                ),
             )
             return cur.rowcount == 1
