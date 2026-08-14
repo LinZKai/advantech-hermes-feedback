@@ -650,6 +650,9 @@ COPY custom/universal-feedback/overlay/migrations/003_retrieval_execution_status
 COPY custom/universal-feedback/overlay/migrations/004_case_analysis.sql \
     /opt/hermes/migrations/004_case_analysis.sql
 
+COPY custom/universal-feedback/overlay/migrations/005_case_analysis_taxonomy_alignment.sql \
+    /opt/hermes/migrations/005_case_analysis_taxonomy_alignment.sql
+
 RUN set -eu; \
     chmod 0644 \
         /opt/hermes/gateway/run.py \
@@ -666,7 +669,8 @@ RUN set -eu; \
         /opt/hermes/migrations/001_universal_feedback.sql \
         /opt/hermes/migrations/002_feedback_schema_v2.sql \
         /opt/hermes/migrations/003_retrieval_execution_statuses.sql \
-        /opt/hermes/migrations/004_case_analysis.sql; \
+        /opt/hermes/migrations/004_case_analysis.sql \
+        /opt/hermes/migrations/005_case_analysis_taxonomy_alignment.sql; \
     /opt/hermes/.venv/bin/python -m py_compile \
         /opt/hermes/gateway/run.py \
         /opt/hermes/gateway/platforms/base.py \

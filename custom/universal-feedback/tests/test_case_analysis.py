@@ -33,10 +33,13 @@ _002_SQL_PATH = _OVERLAY_ROOT / "migrations" / "002_feedback_schema_v2.sql"
 
 from tools.feedback_store_v2 import (  # noqa: E402
     DIAGNOSIS_VALUES,
+    ISSUE_TYPE_VALUES,
     PRODUCT_SOURCE_VALUES,
     FeedbackStoreV2,
     RetrievalRunInput,
 )
+
+_004_SQL_PATH = _OVERLAY_ROOT / "migrations" / "004_case_analysis.sql"
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +107,17 @@ class _StoreTestCase(unittest.TestCase):
                 conn.execute("UPDATE feedback SET submitted_at=? WHERE feedback_id=?", (submitted_at, feedback_id))
         return feedback_id
 
-    def _create_analysis(self, case_id, *, analyzed_at, source_evidence_watermark, analysis_id=None):
+    def _create_analysis(
+        self, case_id, *, analyzed_at, source_evidence_watermark, analysis_id=None,
+        diagnosis="knowledge_gap", diagnosis_confidence=0.5,
+        issue_type="product_usage_or_application", issue_type_confidence=0.5,
+    ):
         analysis_id = analysis_id or uuid.uuid4().hex
         ok = self.store.create_case_analysis(
             analysis_id, case_id,
             case_title="title", issue_summary="summary",
-            diagnosis="knowledge_gap", diagnosis_confidence=0.5,
+            issue_type=issue_type, issue_type_confidence=issue_type_confidence,
+            diagnosis=diagnosis, diagnosis_confidence=diagnosis_confidence,
             product_model=None, product_source=None, product_confidence=None,
             evidence_json=None,
             analysis_version="v1",
@@ -131,6 +139,7 @@ class SchemaTests(_StoreTestCase):
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(case_analysis)").fetchall()}
         expected = {
             "analysis_id", "case_id", "case_title", "issue_summary",
+            "issue_type", "issue_type_confidence",
             "diagnosis", "diagnosis_confidence",
             "product_model", "product_source", "product_confidence",
             "evidence_json", "analysis_version", "analyzed_at",
@@ -138,14 +147,18 @@ class SchemaTests(_StoreTestCase):
         }
         self.assertEqual(cols, expected)
 
+    _BASE_INSERT_COLS = (
+        "analysis_id, case_id, issue_type, issue_type_confidence, "
+        "diagnosis, diagnosis_confidence, analysis_version, analyzed_at, source_evidence_watermark"
+    )
+
     def test_fk_to_unknown_case_id_rejected(self):
         with self._raw_connect() as conn:
             conn.execute("PRAGMA foreign_keys=ON")
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(
-                    "INSERT INTO case_analysis (analysis_id, case_id, diagnosis, analysis_version, analyzed_at, source_evidence_watermark) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    ("a1", "does-not-exist", "knowledge_gap", "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                    f"INSERT INTO case_analysis ({self._BASE_INSERT_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("a1", "does-not-exist", "product_usage_or_application", 0.5, "knowledge_gap", 0.5, "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
                 )
 
     def test_diagnosis_check_constraint_rejects_unknown_value(self):
@@ -154,10 +167,102 @@ class SchemaTests(_StoreTestCase):
             conn.execute("PRAGMA foreign_keys=ON")
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(
-                    "INSERT INTO case_analysis (analysis_id, case_id, diagnosis, analysis_version, analyzed_at, source_evidence_watermark) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    ("a1", "case-1", "not_a_real_diagnosis", "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                    f"INSERT INTO case_analysis ({self._BASE_INSERT_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("a1", "case-1", "product_usage_or_application", 0.5, "not_a_real_diagnosis", 0.5, "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
                 )
+
+    def test_diagnosis_check_constraint_rejects_dropped_legacy_values(self):
+        # workflow_tool_issue / unclear_or_other are no longer valid at the
+        # SQL level either -- confirms the CHECK itself (not just Python
+        # pre-validation) was actually rebuilt to the new 5-value taxonomy.
+        self._seed_session_and_case()
+        for legacy_value in ("workflow_tool_issue", "unclear_or_other"):
+            with self.subTest(diagnosis=legacy_value):
+                with self._raw_connect() as conn:
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        conn.execute(
+                            f"INSERT INTO case_analysis ({self._BASE_INSERT_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (f"a-{legacy_value}", "case-1", "product_usage_or_application", 0.5, legacy_value, 0.5, "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                        )
+
+    def test_issue_type_check_constraint_rejects_unknown_value(self):
+        self._seed_session_and_case()
+        with self._raw_connect() as conn:
+            conn.execute("PRAGMA foreign_keys=ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    f"INSERT INTO case_analysis ({self._BASE_INSERT_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("a1", "case-1", "not_a_real_issue_type", 0.5, "knowledge_gap", 0.5, "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                )
+
+    def test_issue_type_not_null(self):
+        self._seed_session_and_case()
+        with self._raw_connect() as conn:
+            conn.execute("PRAGMA foreign_keys=ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO case_analysis (analysis_id, case_id, issue_type_confidence, diagnosis, diagnosis_confidence, analysis_version, analyzed_at, source_evidence_watermark) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("a1", "case-1", 0.5, "knowledge_gap", 0.5, "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                )
+
+    def test_diagnosis_confidence_not_null(self):
+        self._seed_session_and_case()
+        with self._raw_connect() as conn:
+            conn.execute("PRAGMA foreign_keys=ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO case_analysis (analysis_id, case_id, issue_type, issue_type_confidence, diagnosis, analysis_version, analyzed_at, source_evidence_watermark) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("a1", "case-1", "product_usage_or_application", 0.5, "knowledge_gap", "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                )
+
+    def test_issue_type_confidence_range_check(self):
+        self._seed_session_and_case()
+        for bad_value in (-0.1, 1.1):
+            with self.subTest(issue_type_confidence=bad_value):
+                with self._raw_connect() as conn:
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        conn.execute(
+                            f"INSERT INTO case_analysis ({self._BASE_INSERT_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            ("a1", "case-1", "product_usage_or_application", bad_value, "knowledge_gap", 0.5, "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                        )
+
+    def test_diagnosis_confidence_range_check(self):
+        self._seed_session_and_case()
+        for bad_value in (-0.1, 1.1):
+            with self.subTest(diagnosis_confidence=bad_value):
+                with self._raw_connect() as conn:
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        conn.execute(
+                            f"INSERT INTO case_analysis ({self._BASE_INSERT_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            ("a1", "case-1", "product_usage_or_application", 0.5, "knowledge_gap", bad_value, "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                        )
+
+    def test_product_confidence_range_check_when_not_null(self):
+        self._seed_session_and_case()
+        with self._raw_connect() as conn:
+            conn.execute("PRAGMA foreign_keys=ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO case_analysis "
+                    "(analysis_id, case_id, issue_type, issue_type_confidence, diagnosis, diagnosis_confidence, product_confidence, analysis_version, analyzed_at, source_evidence_watermark) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("a1", "case-1", "product_usage_or_application", 0.5, "knowledge_gap", 0.5, 1.5, "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                )
+
+    def test_product_confidence_null_is_allowed(self):
+        self._seed_session_and_case()
+        with self._raw_connect() as conn:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute(
+                f"INSERT INTO case_analysis ({self._BASE_INSERT_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("a1", "case-1", "product_usage_or_application", 0.5, "knowledge_gap", 0.5, "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+            )
+            conn.commit()  # must not raise -- product_confidence defaults NULL
 
     def test_product_source_check_constraint_rejects_unknown_value(self):
         self._seed_session_and_case()
@@ -165,9 +270,9 @@ class SchemaTests(_StoreTestCase):
             conn.execute("PRAGMA foreign_keys=ON")
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(
-                    "INSERT INTO case_analysis (analysis_id, case_id, diagnosis, product_source, analysis_version, analyzed_at, source_evidence_watermark) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    ("a1", "case-1", "knowledge_gap", "guessed", "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                    "INSERT INTO case_analysis (analysis_id, case_id, issue_type, issue_type_confidence, diagnosis, diagnosis_confidence, product_source, analysis_version, analyzed_at, source_evidence_watermark) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("a1", "case-1", "product_usage_or_application", 0.5, "knowledge_gap", 0.5, "guessed", "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
                 )
 
     def test_product_source_null_is_allowed(self):
@@ -175,9 +280,9 @@ class SchemaTests(_StoreTestCase):
         with self._raw_connect() as conn:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute(
-                "INSERT INTO case_analysis (analysis_id, case_id, diagnosis, product_source, analysis_version, analyzed_at, source_evidence_watermark) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("a1", "case-1", "knowledge_gap", None, "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                "INSERT INTO case_analysis (analysis_id, case_id, issue_type, issue_type_confidence, diagnosis, diagnosis_confidence, product_source, analysis_version, analyzed_at, source_evidence_watermark) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("a1", "case-1", "product_usage_or_application", 0.5, "knowledge_gap", 0.5, None, "v1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
             )
             conn.commit()  # must not raise
 
@@ -243,6 +348,156 @@ class SchemaTests(_StoreTestCase):
         self.assertIsNotNone(upgraded.get_case("case-old"))
         del upgraded
         gc.collect()
+
+
+class Migration004To005Tests(_StoreTestCase):
+    """Stage B.5 Schema Alignment: an existing database already at the 004
+    shape (with real case_analysis rows using the OLD 6-value diagnosis
+    taxonomy and no issue_type/issue_type_confidence columns) must upgrade
+    cleanly to the new shape the next time FeedbackStoreV2 opens it."""
+
+    def _seed_004_shape_db(self, db_path):
+        sql_002 = _002_SQL_PATH.read_text(encoding="utf-8")
+        sql_004 = _004_SQL_PATH.read_text(encoding="utf-8")
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(sql_002)
+            conn.executescript(sql_004)
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute(
+                "INSERT INTO sessions (session_id, platform, platform_chat_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                ("sess-old", "telegram", "chat-old", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+            )
+            conn.execute(
+                "INSERT INTO cases (case_id, session_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                ("case-old", "sess-old", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+            )
+            # unclear_or_other -- has a real diagnosis_confidence.
+            conn.execute(
+                "INSERT INTO case_analysis (analysis_id, case_id, case_title, issue_summary, diagnosis, diagnosis_confidence, analysis_version, analyzed_at, source_evidence_watermark) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("a-unclear", "case-old", "old title", "old summary", "unclear_or_other", 0.4, "v0", "2026-01-01T00:00:01+00:00", "2026-01-01T00:00:00+00:00"),
+            )
+            # workflow_tool_issue -- diagnosis_confidence left NULL (the old
+            # API accepted this).
+            conn.execute(
+                "INSERT INTO case_analysis (analysis_id, case_id, diagnosis, analysis_version, analyzed_at, source_evidence_watermark) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("a-workflow", "case-old", "workflow_tool_issue", "v0", "2026-01-02T00:00:00+00:00", "2026-01-02T00:00:00+00:00"),
+            )
+            # A row already using a taxonomy value that survives unchanged.
+            conn.execute(
+                "INSERT INTO case_analysis (analysis_id, case_id, diagnosis, diagnosis_confidence, analysis_version, analyzed_at, source_evidence_watermark) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("a-unchanged", "case-old", "knowledge_gap", 0.9, "v0", "2026-01-03T00:00:00+00:00", "2026-01-03T00:00:00+00:00"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_unclear_or_other_renamed_to_other_or_unclear(self):
+        db_path = Path(self._tmpdir.name) / "pre_005.db"
+        self._seed_004_shape_db(db_path)
+        upgraded = FeedbackStoreV2(db_path)
+        try:
+            with sqlite3.connect(db_path) as raw:
+                raw.row_factory = sqlite3.Row
+                row = raw.execute("SELECT * FROM case_analysis WHERE analysis_id=?", ("a-unclear",)).fetchone()
+            self.assertEqual(row["diagnosis"], "other_or_unclear")
+            self.assertEqual(row["diagnosis_confidence"], 0.4)  # preserved, was not NULL
+        finally:
+            del upgraded
+            gc.collect()
+
+    def test_workflow_tool_issue_downgraded_to_other_or_unclear(self):
+        db_path = Path(self._tmpdir.name) / "pre_005.db"
+        self._seed_004_shape_db(db_path)
+        upgraded = FeedbackStoreV2(db_path)
+        try:
+            with sqlite3.connect(db_path) as raw:
+                raw.row_factory = sqlite3.Row
+                row = raw.execute("SELECT * FROM case_analysis WHERE analysis_id=?", ("a-workflow",)).fetchone()
+            self.assertEqual(row["diagnosis"], "other_or_unclear")
+            self.assertEqual(row["diagnosis_confidence"], 0.0)  # fallback, was NULL
+        finally:
+            del upgraded
+            gc.collect()
+
+    def test_legacy_rows_get_issue_type_fallback(self):
+        db_path = Path(self._tmpdir.name) / "pre_005.db"
+        self._seed_004_shape_db(db_path)
+        upgraded = FeedbackStoreV2(db_path)
+        try:
+            with sqlite3.connect(db_path) as raw:
+                raw.row_factory = sqlite3.Row
+                rows = raw.execute("SELECT * FROM case_analysis").fetchall()
+            self.assertEqual(len(rows), 3)
+            for row in rows:
+                self.assertEqual(row["issue_type"], "other_or_unclear")
+                self.assertEqual(row["issue_type_confidence"], 0.0)
+        finally:
+            del upgraded
+            gc.collect()
+
+    def test_unaffected_diagnosis_value_and_other_columns_preserved(self):
+        db_path = Path(self._tmpdir.name) / "pre_005.db"
+        self._seed_004_shape_db(db_path)
+        upgraded = FeedbackStoreV2(db_path)
+        try:
+            with sqlite3.connect(db_path) as raw:
+                raw.row_factory = sqlite3.Row
+                row = raw.execute("SELECT * FROM case_analysis WHERE analysis_id=?", ("a-unchanged",)).fetchone()
+            self.assertEqual(row["diagnosis"], "knowledge_gap")
+            self.assertEqual(row["diagnosis_confidence"], 0.9)
+
+            unclear_row = raw.execute("SELECT * FROM case_analysis WHERE analysis_id=?", ("a-unclear",)).fetchone()
+            self.assertEqual(unclear_row["case_title"], "old title")
+            self.assertEqual(unclear_row["issue_summary"], "old summary")
+            self.assertEqual(unclear_row["analysis_version"], "v0")
+            self.assertEqual(unclear_row["analyzed_at"], "2026-01-01T00:00:01+00:00")
+            self.assertEqual(unclear_row["source_evidence_watermark"], "2026-01-01T00:00:00+00:00")
+        finally:
+            del upgraded
+            gc.collect()
+
+    def test_new_check_constraints_active_after_upgrade(self):
+        # Confirms the rebuilt table really has the new CHECK constraints
+        # live, not just the right column set -- a new INSERT using a
+        # dropped legacy diagnosis value must now be rejected.
+        db_path = Path(self._tmpdir.name) / "pre_005.db"
+        self._seed_004_shape_db(db_path)
+        upgraded = FeedbackStoreV2(db_path)
+        try:
+            ok = upgraded.create_case_analysis(
+                "a-new", "case-old",
+                case_title=None, issue_summary=None,
+                issue_type="product_usage_or_application", issue_type_confidence=0.5,
+                diagnosis="workflow_tool_issue", diagnosis_confidence=0.5,
+                product_model=None, product_source=None, product_confidence=None,
+                evidence_json=None, analysis_version="v1",
+                analyzed_at="2026-01-04T00:00:00+00:00",
+                source_evidence_watermark="2026-01-04T00:00:00+00:00",
+            )
+            self.assertFalse(ok)
+        finally:
+            del upgraded
+            gc.collect()
+
+    def test_upgrade_is_idempotent(self):
+        db_path = Path(self._tmpdir.name) / "pre_005.db"
+        self._seed_004_shape_db(db_path)
+        first = FeedbackStoreV2(db_path)
+        del first
+        gc.collect()
+        second = FeedbackStoreV2(db_path)
+        try:
+            with sqlite3.connect(db_path) as raw:
+                raw.row_factory = sqlite3.Row
+                count = raw.execute("SELECT COUNT(*) AS n FROM case_analysis").fetchone()["n"]
+            self.assertEqual(count, 3)  # not duplicated by re-running the upgrade
+        finally:
+            del second
+            gc.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +662,8 @@ class AnalysisPersistenceTests(_StoreTestCase):
         ok = self.store.create_case_analysis(
             "a1", "case-1",
             case_title=None, issue_summary=None,
-            diagnosis="not_a_real_diagnosis", diagnosis_confidence=None,
+            issue_type="product_usage_or_application", issue_type_confidence=0.5,
+            diagnosis="not_a_real_diagnosis", diagnosis_confidence=0.5,
             product_model=None, product_source=None, product_confidence=None,
             evidence_json=None, analysis_version="v1",
             analyzed_at="2026-01-01T00:00:00+00:00",
@@ -416,13 +672,30 @@ class AnalysisPersistenceTests(_StoreTestCase):
         self.assertFalse(ok)
         self.assertIsNone(self.store.get_latest_case_analysis("case-1"))
 
+    def test_diagnosis_dropped_legacy_values_rejected(self):
+        self._seed_session_and_case()
+        for legacy_value in ("workflow_tool_issue", "unclear_or_other"):
+            with self.subTest(diagnosis=legacy_value):
+                ok = self.store.create_case_analysis(
+                    f"a-{legacy_value}", "case-1",
+                    case_title=None, issue_summary=None,
+                    issue_type="product_usage_or_application", issue_type_confidence=0.5,
+                    diagnosis=legacy_value, diagnosis_confidence=0.5,
+                    product_model=None, product_source=None, product_confidence=None,
+                    evidence_json=None, analysis_version="v1",
+                    analyzed_at="2026-01-01T00:00:00+00:00",
+                    source_evidence_watermark="2026-01-01T00:00:00+00:00",
+                )
+                self.assertFalse(ok)
+
     def test_invalid_product_source_rejected(self):
         self._seed_session_and_case()
         ok = self.store.create_case_analysis(
             "a1", "case-1",
             case_title=None, issue_summary=None,
-            diagnosis="knowledge_gap", diagnosis_confidence=None,
-            product_model="ADAM-6266", product_source="guessed", product_confidence=None,
+            issue_type="product_usage_or_application", issue_type_confidence=0.5,
+            diagnosis="knowledge_gap", diagnosis_confidence=0.5,
+            product_model="ADAM-6266", product_source="guessed", product_confidence=0.5,
             evidence_json=None, analysis_version="v1",
             analyzed_at="2026-01-01T00:00:00+00:00",
             source_evidence_watermark="2026-01-01T00:00:00+00:00",
@@ -434,7 +707,8 @@ class AnalysisPersistenceTests(_StoreTestCase):
         ok = self.store.create_case_analysis(
             "a1", "case-1",
             case_title=None, issue_summary=None,
-            diagnosis="no_issue_detected", diagnosis_confidence=None,
+            issue_type="product_usage_or_application", issue_type_confidence=0.5,
+            diagnosis="no_issue_detected", diagnosis_confidence=0.5,
             product_model=None, product_source=None, product_confidence=None,
             evidence_json=None, analysis_version="v1",
             analyzed_at="2026-01-01T00:00:00+00:00",
@@ -444,18 +718,51 @@ class AnalysisPersistenceTests(_StoreTestCase):
 
     def test_all_diagnosis_values_accepted(self):
         self._seed_session_and_case()
+        self.assertEqual(len(DIAGNOSIS_VALUES), 5)
         for i, diagnosis in enumerate(DIAGNOSIS_VALUES):
             with self.subTest(diagnosis=diagnosis):
                 ok = self.store.create_case_analysis(
                     f"a{i}", "case-1",
                     case_title=None, issue_summary=None,
-                    diagnosis=diagnosis, diagnosis_confidence=None,
+                    issue_type="product_usage_or_application", issue_type_confidence=0.5,
+                    diagnosis=diagnosis, diagnosis_confidence=0.5,
                     product_model=None, product_source=None, product_confidence=None,
                     evidence_json=None, analysis_version="v1",
                     analyzed_at=f"2026-01-0{i + 1}T00:00:00+00:00",
                     source_evidence_watermark=f"2026-01-0{i + 1}T00:00:00+00:00",
                 )
                 self.assertTrue(ok)
+
+    def test_all_issue_type_values_accepted(self):
+        self._seed_session_and_case()
+        self.assertEqual(len(ISSUE_TYPE_VALUES), 4)
+        for i, issue_type in enumerate(ISSUE_TYPE_VALUES):
+            with self.subTest(issue_type=issue_type):
+                ok = self.store.create_case_analysis(
+                    f"a{i}", "case-1",
+                    case_title=None, issue_summary=None,
+                    issue_type=issue_type, issue_type_confidence=0.5,
+                    diagnosis="knowledge_gap", diagnosis_confidence=0.5,
+                    product_model=None, product_source=None, product_confidence=None,
+                    evidence_json=None, analysis_version="v1",
+                    analyzed_at=f"2026-01-0{i + 1}T00:00:00+00:00",
+                    source_evidence_watermark=f"2026-01-0{i + 1}T00:00:00+00:00",
+                )
+                self.assertTrue(ok)
+
+    def test_invalid_issue_type_rejected(self):
+        self._seed_session_and_case()
+        ok = self.store.create_case_analysis(
+            "a1", "case-1",
+            case_title=None, issue_summary=None,
+            issue_type="not_a_real_issue_type", issue_type_confidence=0.5,
+            diagnosis="knowledge_gap", diagnosis_confidence=0.5,
+            product_model=None, product_source=None, product_confidence=None,
+            evidence_json=None, analysis_version="v1",
+            analyzed_at="2026-01-01T00:00:00+00:00",
+            source_evidence_watermark="2026-01-01T00:00:00+00:00",
+        )
+        self.assertFalse(ok)
 
     def test_all_product_source_values_accepted(self):
         self._seed_session_and_case()
@@ -464,7 +771,8 @@ class AnalysisPersistenceTests(_StoreTestCase):
                 ok = self.store.create_case_analysis(
                     f"a{i}", "case-1",
                     case_title=None, issue_summary=None,
-                    diagnosis="knowledge_gap", diagnosis_confidence=None,
+                    issue_type="product_usage_or_application", issue_type_confidence=0.5,
+                    diagnosis="knowledge_gap", diagnosis_confidence=0.5,
                     product_model="ADAM-6266", product_source=source, product_confidence=0.9,
                     evidence_json=None, analysis_version="v1",
                     analyzed_at=f"2026-01-0{i + 1}T00:00:00+00:00",
@@ -472,11 +780,110 @@ class AnalysisPersistenceTests(_StoreTestCase):
                 )
                 self.assertTrue(ok)
 
+    def test_product_model_present_missing_product_source_rejected(self):
+        # Stage B.5 Schema Alignment: the storage layer now enforces the
+        # same product_model/product_source/product_confidence consistency
+        # rule CaseEnrichmentResult.__post_init__ already enforces -- this
+        # was NOT previously checked at the storage layer (a pre-alignment
+        # audit found the gap).
+        self._seed_session_and_case()
+        ok = self.store.create_case_analysis(
+            "a1", "case-1",
+            case_title=None, issue_summary=None,
+            issue_type="product_usage_or_application", issue_type_confidence=0.5,
+            diagnosis="knowledge_gap", diagnosis_confidence=0.5,
+            product_model="ADAM-6266", product_source=None, product_confidence=0.9,
+            evidence_json=None, analysis_version="v1",
+            analyzed_at="2026-01-01T00:00:00+00:00",
+            source_evidence_watermark="2026-01-01T00:00:00+00:00",
+        )
+        self.assertFalse(ok)
+
+    def test_product_model_present_missing_product_confidence_rejected(self):
+        self._seed_session_and_case()
+        ok = self.store.create_case_analysis(
+            "a1", "case-1",
+            case_title=None, issue_summary=None,
+            issue_type="product_usage_or_application", issue_type_confidence=0.5,
+            diagnosis="knowledge_gap", diagnosis_confidence=0.5,
+            product_model="ADAM-6266", product_source="explicit_user_text", product_confidence=None,
+            evidence_json=None, analysis_version="v1",
+            analyzed_at="2026-01-01T00:00:00+00:00",
+            source_evidence_watermark="2026-01-01T00:00:00+00:00",
+        )
+        self.assertFalse(ok)
+
+    def test_no_product_model_but_product_confidence_present_rejected(self):
+        self._seed_session_and_case()
+        ok = self.store.create_case_analysis(
+            "a1", "case-1",
+            case_title=None, issue_summary=None,
+            issue_type="product_usage_or_application", issue_type_confidence=0.5,
+            diagnosis="knowledge_gap", diagnosis_confidence=0.5,
+            product_model=None, product_source=None, product_confidence=0.5,
+            evidence_json=None, analysis_version="v1",
+            analyzed_at="2026-01-01T00:00:00+00:00",
+            source_evidence_watermark="2026-01-01T00:00:00+00:00",
+        )
+        self.assertFalse(ok)
+
+    def test_confidence_boundary_and_invalid_values(self):
+        self._seed_session_and_case()
+        base_kwargs = dict(
+            case_title=None, issue_summary=None,
+            product_model=None, product_source=None, product_confidence=None,
+            evidence_json=None, analysis_version="v1",
+            source_evidence_watermark="2026-01-01T00:00:00+00:00",
+        )
+        cases = [
+            ("boundary_zero", {"issue_type_confidence": 0.0, "diagnosis_confidence": 0.5}, True),
+            ("boundary_one", {"issue_type_confidence": 1.0, "diagnosis_confidence": 0.5}, True),
+            ("diag_boundary_zero", {"issue_type_confidence": 0.5, "diagnosis_confidence": 0.0}, True),
+            ("diag_boundary_one", {"issue_type_confidence": 0.5, "diagnosis_confidence": 1.0}, True),
+            ("issue_below_zero", {"issue_type_confidence": -0.1, "diagnosis_confidence": 0.5}, False),
+            ("issue_above_one", {"issue_type_confidence": 1.1, "diagnosis_confidence": 0.5}, False),
+            ("issue_bool", {"issue_type_confidence": True, "diagnosis_confidence": 0.5}, False),
+            ("issue_nan", {"issue_type_confidence": float("nan"), "diagnosis_confidence": 0.5}, False),
+            ("issue_inf", {"issue_type_confidence": float("inf"), "diagnosis_confidence": 0.5}, False),
+            ("diag_below_zero", {"issue_type_confidence": 0.5, "diagnosis_confidence": -0.1}, False),
+            ("diag_above_one", {"issue_type_confidence": 0.5, "diagnosis_confidence": 1.1}, False),
+            ("diag_bool", {"issue_type_confidence": 0.5, "diagnosis_confidence": True}, False),
+            ("diag_nan", {"issue_type_confidence": 0.5, "diagnosis_confidence": float("nan")}, False),
+            ("diag_inf", {"issue_type_confidence": 0.5, "diagnosis_confidence": float("inf")}, False),
+        ]
+        for i, (name, overrides, expected) in enumerate(cases):
+            with self.subTest(case=name):
+                ok = self.store.create_case_analysis(
+                    f"a{i}", "case-1",
+                    issue_type="product_usage_or_application",
+                    diagnosis="knowledge_gap",
+                    analyzed_at=f"2026-02-{i + 1:02d}T00:00:00+00:00",
+                    **base_kwargs, **overrides,
+                )
+                self.assertEqual(ok, expected, name)
+
+    def test_product_confidence_invalid_values_rejected(self):
+        self._seed_session_and_case()
+        for bad_value in (-0.1, 1.1, True, float("nan"), float("inf")):
+            with self.subTest(product_confidence=bad_value):
+                ok = self.store.create_case_analysis(
+                    "a1", "case-1",
+                    case_title=None, issue_summary=None,
+                    issue_type="product_usage_or_application", issue_type_confidence=0.5,
+                    diagnosis="knowledge_gap", diagnosis_confidence=0.5,
+                    product_model="ADAM-6266", product_source="explicit_user_text", product_confidence=bad_value,
+                    evidence_json=None, analysis_version="v1",
+                    analyzed_at="2026-01-01T00:00:00+00:00",
+                    source_evidence_watermark="2026-01-01T00:00:00+00:00",
+                )
+                self.assertFalse(ok)
+
     def test_unknown_case_id_rejected_not_raised(self):
         ok = self.store.create_case_analysis(
             "a1", "does-not-exist",
             case_title=None, issue_summary=None,
-            diagnosis="knowledge_gap", diagnosis_confidence=None,
+            issue_type="product_usage_or_application", issue_type_confidence=0.5,
+            diagnosis="knowledge_gap", diagnosis_confidence=0.5,
             product_model=None, product_source=None, product_confidence=None,
             evidence_json=None, analysis_version="v1",
             analyzed_at="2026-01-01T00:00:00+00:00",
@@ -490,7 +897,8 @@ class AnalysisPersistenceTests(_StoreTestCase):
         ok = self.store.create_case_analysis(
             "a2", "case-1",  # different analysis_id, SAME (case_id, analyzed_at)
             case_title=None, issue_summary=None,
-            diagnosis="knowledge_gap", diagnosis_confidence=None,
+            issue_type="product_usage_or_application", issue_type_confidence=0.5,
+            diagnosis="knowledge_gap", diagnosis_confidence=0.5,
             product_model=None, product_source=None, product_confidence=None,
             evidence_json=None, analysis_version="v1",
             analyzed_at="2026-01-01T00:00:00+00:00",
@@ -504,6 +912,7 @@ class AnalysisPersistenceTests(_StoreTestCase):
         ok = self.store.create_case_analysis(
             "a1", "case-1",
             case_title="ADAM-6266 SNMP issue", issue_summary="summary text",
+            issue_type="product_capability_or_compatibility", issue_type_confidence=0.85,
             diagnosis="knowledge_gap", diagnosis_confidence=0.7,
             product_model="ADAM-6266", product_source="explicit_user_text", product_confidence=0.95,
             evidence_json=evidence, analysis_version="v1",
@@ -513,8 +922,13 @@ class AnalysisPersistenceTests(_StoreTestCase):
         self.assertTrue(ok)
         row = self.store.get_latest_case_analysis("case-1")
         self.assertEqual(row["case_title"], "ADAM-6266 SNMP issue")
+        self.assertEqual(row["issue_type"], "product_capability_or_compatibility")
+        self.assertEqual(row["issue_type_confidence"], 0.85)
+        self.assertEqual(row["diagnosis"], "knowledge_gap")
+        self.assertEqual(row["diagnosis_confidence"], 0.7)
         self.assertEqual(row["product_model"], "ADAM-6266")
         self.assertEqual(row["product_source"], "explicit_user_text")
+        self.assertEqual(row["product_confidence"], 0.95)
         self.assertEqual(json.loads(row["evidence_json"]), json.loads(evidence))
 
     def test_does_not_touch_cases_title_or_product_model(self):

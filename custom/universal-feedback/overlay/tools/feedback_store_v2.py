@@ -34,9 +34,26 @@ that never existed before, on both a brand-new database and an existing one
 already at the 002/003 shape. Stage A only adds the schema and query
 surface below -- no LLM call, no enrichment service, and no runner exist
 yet; those are later stages.
+
+Migration 005 (see ../migrations/005_case_analysis_taxonomy_alignment.sql,
+Phase 4.5 Stage B.5 Schema Alignment): rebuilds `case_analysis` so it
+matches the finalized Stage B tools.case_enrichment.CaseEnrichmentResult
+contract -- narrows `diagnosis` from 6 values to 5 (drops
+'workflow_tool_issue', renames 'unclear_or_other' to 'other_or_unclear'),
+adds NOT NULL `issue_type`/`issue_type_confidence`, and adds range CHECK
+constraints (0.0-1.0) to all three confidence columns. This module is now
+the taxonomy authority for DIAGNOSIS_VALUES/ISSUE_TYPE_VALUES/
+PRODUCT_SOURCE_VALUES -- tools.case_enrichment imports all three from here
+rather than maintaining its own copies. Like migration 003 (and unlike
+004), this needs the full rebuild recipe, because it changes an existing
+CHECK constraint and tightens existing columns to NOT NULL, not just adds
+new tables. See _upgrade_case_analysis_taxonomy() below for the legacy-data
+handling this rebuild applies (never a silent guess at Issue Type for
+pre-existing rows -- see that method's docstring).
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -88,24 +105,63 @@ _EXECUTION_STATUS_SET = frozenset(EXECUTION_STATUSES)
 OBSERVATION_STATUSES: tuple[str, ...] = ("complete", "partial", "unavailable")
 _OBSERVATION_STATUS_SET = frozenset(OBSERVATION_STATUSES)
 
-# Phase 4.5 Stage A: case_analysis.diagnosis / case_analysis.product_source
-# fixed vocabularies -- kept in sync with the CHECK constraints in
+# Phase 4.5 Stage B.5 Schema Alignment: case_analysis.diagnosis /
+# case_analysis.issue_type / case_analysis.product_source fixed
+# vocabularies -- kept in sync with the CHECK constraints in
 # _SCHEMA_STATEMENTS below, so create_case_analysis() can fail closed in
 # Python (matching submit_feedback()'s pre-validation convention) before
 # ever attempting the INSERT, rather than relying solely on the DB-level
 # CHECK to reject bad input.
+#
+# This module is the taxonomy authority for all three constants below --
+# tools.case_enrichment.CaseEnrichmentResult imports DIAGNOSIS_VALUES/
+# ISSUE_TYPE_VALUES/PRODUCT_SOURCE_VALUES from here rather than maintaining
+# its own copies (an earlier Stage B draft did keep a local, deliberately
+# diverging DIAGNOSIS_VALUES while the two contracts were still being
+# finalized; that divergence is resolved now that both are aligned to the
+# same 5-value diagnosis / 4-value issue_type taxonomy below).
 DIAGNOSIS_VALUES: tuple[str, ...] = (
     "knowledge_gap",
     "retrieval_issue",
     "answer_quality_issue",
-    "workflow_tool_issue",
-    "unclear_or_other",
+    "other_or_unclear",
     "no_issue_detected",
 )
 _DIAGNOSIS_VALUE_SET = frozenset(DIAGNOSIS_VALUES)
 
+ISSUE_TYPE_VALUES: tuple[str, ...] = (
+    "product_usage_or_application",
+    "product_capability_or_compatibility",
+    "product_issue",
+    "other_or_unclear",
+)
+_ISSUE_TYPE_VALUE_SET = frozenset(ISSUE_TYPE_VALUES)
+
 PRODUCT_SOURCE_VALUES: tuple[str, ...] = ("explicit_user_text", "inference")
 _PRODUCT_SOURCE_VALUE_SET = frozenset(PRODUCT_SOURCE_VALUES)
+
+
+def _is_valid_confidence(value: Any) -> bool:
+    """True only for a real, finite number in [0.0, 1.0].
+
+    Mirrors the same defensive pattern independently maintained in
+    tools.case_routing._is_valid_confidence and (until this alignment)
+    tools.case_enrichment._is_valid_confidence -- bool is rejected before
+    the int check (bool is an int subclass in Python, so `True` would
+    otherwise silently pass as confidence=1), and non-standard JSON tokens
+    NaN/Infinity/-Infinity (which Python's json module accepts by default)
+    are rejected explicitly. This module keeps its own copy rather than
+    importing either of those modules' leading-underscore helpers --
+    neither exports it, and this storage-layer boundary should not depend
+    on either higher-level module to validate a primitive value.
+    """
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return False
+    return 0.0 <= value <= 1.0
 
 # Fixed, safe reason stored on turns.retrieval_observation_reason when a
 # retrieval-insert batch fails and is rolled back -- never the underlying
@@ -249,16 +305,28 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         )
     )
     """,
-    # Phase 4.5 Stage A: append-only analysis history for a Case. Never
-    # updated in place -- create_case_analysis() only ever INSERTs, and
-    # UNIQUE(case_id, analyzed_at) is the only uniqueness constraint (not
-    # UNIQUE(case_id) alone), so re-analysis is always a new row, never an
-    # overwrite of a prior one. source_evidence_watermark is NOT
-    # cases.updated_at (that column is only ever set once, at Case
-    # creation -- see get_case_evidence_watermark()'s docstring) -- it is
-    # the MAX(turns.created_at, feedback.submitted_at, retrieval_runs.
+    # Phase 4.5 Stage B.5 Schema Alignment: append-only analysis history
+    # for a Case, aligned to the finalized tools.case_enrichment.
+    # CaseEnrichmentResult contract. Never updated in place --
+    # create_case_analysis() only ever INSERTs, and UNIQUE(case_id,
+    # analyzed_at) is the only uniqueness constraint (not UNIQUE(case_id)
+    # alone), so re-analysis is always a new row, never an overwrite of a
+    # prior one. source_evidence_watermark is NOT cases.updated_at (that
+    # column is only ever set once, at Case creation -- see
+    # get_case_evidence_watermark()'s docstring) -- it is the
+    # MAX(turns.created_at, feedback.submitted_at, retrieval_runs.
     # created_at) this analysis run actually saw, recorded so a later run
     # can tell whether new evidence has arrived since.
+    #
+    # issue_type/issue_type_confidence and diagnosis/diagnosis_confidence
+    # are both NOT NULL: CaseEnrichmentResult requires all four fields
+    # unconditionally (never None), so the storage layer now enforces the
+    # same invariant rather than only relying on the dataclass layer.
+    # product_source/product_confidence stay nullable together (a Case can
+    # legitimately have no identified product) but are range/membership
+    # CHECKed when present -- see create_case_analysis()'s docstring for
+    # the exact product_model/product_source/product_confidence
+    # consistency rule this mirrors.
     """
     CREATE TABLE IF NOT EXISTS case_analysis (
         analysis_id TEXT PRIMARY KEY,
@@ -267,18 +335,31 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         case_title      TEXT,
         issue_summary   TEXT,
 
+        issue_type            TEXT NOT NULL CHECK (issue_type IN (
+            'product_usage_or_application', 'product_capability_or_compatibility',
+            'product_issue', 'other_or_unclear'
+        )),
+        issue_type_confidence REAL NOT NULL CHECK (
+            issue_type_confidence >= 0.0 AND issue_type_confidence <= 1.0
+        ),
+
         diagnosis            TEXT NOT NULL CHECK (diagnosis IN (
             'knowledge_gap', 'retrieval_issue', 'answer_quality_issue',
-            'workflow_tool_issue', 'unclear_or_other', 'no_issue_detected'
+            'other_or_unclear', 'no_issue_detected'
         )),
-        diagnosis_confidence REAL,
+        diagnosis_confidence REAL NOT NULL CHECK (
+            diagnosis_confidence >= 0.0 AND diagnosis_confidence <= 1.0
+        ),
 
         product_model      TEXT,
         product_source      TEXT CHECK (
             product_source IN ('explicit_user_text', 'inference')
             OR product_source IS NULL
         ),
-        product_confidence  REAL,
+        product_confidence  REAL CHECK (
+            product_confidence IS NULL
+            OR (product_confidence >= 0.0 AND product_confidence <= 1.0)
+        ),
 
         evidence_json TEXT,
 
@@ -373,6 +454,97 @@ _RETRIEVAL_RUNS_REBUILD_STATEMENTS: tuple[str, ...] = (
 # against a hand-edited database.
 _EXECUTION_STATUS_UPGRADE_MARKERS = ("'blocked'", "'unparseable'")
 
+# Migration 005 (see ../migrations/005_case_analysis_taxonomy_alignment.sql):
+# rebuild case_analysis in place to align it with the finalized Stage B
+# CaseEnrichmentResult contract -- narrows diagnosis to 5 values, adds NOT
+# NULL issue_type/issue_type_confidence, and adds range CHECK constraints to
+# all three confidence columns. Same recipe as migration 003 (SQLite has no
+# `ALTER TABLE ... DROP/ADD CONSTRAINT`, so a CHECK/NOT NULL change requires
+# the shadow-table rebuild), but unlike 003's straight unchanged-row copy,
+# this INSERT...SELECT also TRANSFORMS legacy data -- see
+# FeedbackStoreV2._upgrade_case_analysis_taxonomy()'s docstring for the
+# exact, documented (never silently guessed) legacy-value handling:
+#   * diagnosis 'unclear_or_other'   -> 'other_or_unclear' (pure rename)
+#   * diagnosis 'workflow_tool_issue' -> 'other_or_unclear' (lossy downgrade;
+#     the new taxonomy has no workflow/tool-specific bucket)
+#   * diagnosis_confidence NULL      -> 0.0 (explicit fallback sentinel;
+#     the old API accepted a missing confidence, the new contract does not)
+#   * issue_type / issue_type_confidence did not exist before this
+#     migration -> every pre-existing row gets the fixed fallback
+#     ('other_or_unclear', 0.0), never a value inferred from case_title/
+#     issue_summary -- a migration must never fabricate an AI classification.
+# Never touches feedback_runs, sessions, cases, turns, feedback, or
+# retrieval_runs.
+_CASE_ANALYSIS_REBUILD_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE case_analysis_new (
+        analysis_id TEXT PRIMARY KEY,
+        case_id     TEXT NOT NULL REFERENCES cases(case_id),
+
+        case_title      TEXT,
+        issue_summary   TEXT,
+
+        issue_type            TEXT NOT NULL CHECK (issue_type IN (
+            'product_usage_or_application', 'product_capability_or_compatibility',
+            'product_issue', 'other_or_unclear'
+        )),
+        issue_type_confidence REAL NOT NULL CHECK (
+            issue_type_confidence >= 0.0 AND issue_type_confidence <= 1.0
+        ),
+
+        diagnosis            TEXT NOT NULL CHECK (diagnosis IN (
+            'knowledge_gap', 'retrieval_issue', 'answer_quality_issue',
+            'other_or_unclear', 'no_issue_detected'
+        )),
+        diagnosis_confidence REAL NOT NULL CHECK (
+            diagnosis_confidence >= 0.0 AND diagnosis_confidence <= 1.0
+        ),
+
+        product_model      TEXT,
+        product_source      TEXT CHECK (
+            product_source IN ('explicit_user_text', 'inference')
+            OR product_source IS NULL
+        ),
+        product_confidence  REAL CHECK (
+            product_confidence IS NULL
+            OR (product_confidence >= 0.0 AND product_confidence <= 1.0)
+        ),
+
+        evidence_json TEXT,
+
+        analysis_version TEXT NOT NULL,
+        analyzed_at      TEXT NOT NULL,
+
+        source_evidence_watermark TEXT NOT NULL,
+
+        UNIQUE (case_id, analyzed_at)
+    )
+    """,
+    """
+    INSERT INTO case_analysis_new (
+        analysis_id, case_id, case_title, issue_summary,
+        issue_type, issue_type_confidence,
+        diagnosis, diagnosis_confidence,
+        product_model, product_source, product_confidence,
+        evidence_json, analysis_version, analyzed_at, source_evidence_watermark
+    )
+    SELECT
+        analysis_id, case_id, case_title, issue_summary,
+        'other_or_unclear', 0.0,
+        CASE
+            WHEN diagnosis IN ('unclear_or_other', 'workflow_tool_issue') THEN 'other_or_unclear'
+            ELSE diagnosis
+        END,
+        COALESCE(diagnosis_confidence, 0.0),
+        product_model, product_source, product_confidence,
+        evidence_json, analysis_version, analyzed_at, source_evidence_watermark
+    FROM case_analysis
+    """,
+    "DROP TABLE case_analysis",
+    "ALTER TABLE case_analysis_new RENAME TO case_analysis",
+    "CREATE INDEX IF NOT EXISTS idx_case_analysis_case ON case_analysis(case_id)",
+)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -452,6 +624,7 @@ class FeedbackStoreV2:
             for statement in _SCHEMA_STATEMENTS:
                 db.execute(statement)
         self._upgrade_retrieval_runs_execution_statuses()
+        self._upgrade_case_analysis_taxonomy()
 
     def _retrieval_runs_needs_execution_status_upgrade(self, db: sqlite3.Connection) -> bool:
         """Detect an existing pre-003 retrieval_runs table by inspecting
@@ -522,6 +695,108 @@ class FeedbackStoreV2:
                     if violations:
                         raise sqlite3.IntegrityError(
                             f"retrieval_runs rebuild left {len(violations)} "
+                            "foreign_key_check violation(s)"
+                        )
+                except Exception:
+                    db.execute("ROLLBACK")
+                    raise
+                else:
+                    db.execute("COMMIT")
+            finally:
+                db.execute("PRAGMA foreign_keys=ON")
+        finally:
+            db.close()
+
+    def _case_analysis_needs_taxonomy_upgrade(self, db: sqlite3.Connection) -> bool:
+        """Detect a case_analysis table still at the pre-Stage-B.5
+        (migration 004) shape.
+
+        Unlike _retrieval_runs_needs_execution_status_upgrade (which reads
+        the live CHECK constraint text out of sqlite_master.sql, because
+        migration 003 changes a CHECK without changing the column set),
+        this checks column presence via PRAGMA table_info -- sufficient
+        and simpler here because migration 005 also adds real columns
+        (issue_type/issue_type_confidence), so there is no scenario where
+        the columns already exist but the CHECK is still stale on its own.
+        Returns False (nothing to do) both when already upgraded AND when
+        the table does not exist yet at all (a fresh database, already
+        created in the latest shape by _SCHEMA_STATEMENTS above).
+        """
+        cols = {row["name"] for row in db.execute("PRAGMA table_info(case_analysis)").fetchall()}
+        if not cols:
+            return False
+        return "issue_type" not in cols
+
+    def _upgrade_case_analysis_taxonomy(self) -> None:
+        """Migration 005 (see
+        ../migrations/005_case_analysis_taxonomy_alignment.sql): rebuild
+        case_analysis in place to match the finalized Stage B
+        CaseEnrichmentResult contract -- narrows diagnosis to 5 values,
+        adds NOT NULL issue_type/issue_type_confidence, and adds range
+        CHECK constraints to all three confidence columns.
+
+        Same rebuild choreography as
+        _upgrade_retrieval_runs_execution_statuses (migration 003): a
+        dedicated connection, PRAGMA foreign_keys turned OFF before BEGIN
+        and back ON after COMMIT/ROLLBACK (in a finally), BEGIN IMMEDIATE,
+        a shadow table, an explicit-column INSERT...SELECT (never
+        `SELECT *`), DROP + RENAME, the index recreated by name, and
+        PRAGMA foreign_key_check verified before COMMIT -- any failure at
+        any step rolls back the whole transaction, leaving the original
+        case_analysis table and its data completely untouched.
+
+        Legacy data handling in the INSERT...SELECT
+        (_CASE_ANALYSIS_REBUILD_STATEMENTS) -- every case documented, none
+        silently guessed:
+          * diagnosis 'unclear_or_other' -> 'other_or_unclear': a pure
+            rename, same meaning, per the finalized Stage B taxonomy.
+          * diagnosis 'workflow_tool_issue' -> 'other_or_unclear': a real,
+            intentional LOSSY downgrade, not a semantic-equivalence rename
+            -- the new taxonomy has no workflow/tool-specific bucket at
+            all. This is the documented product decision for this
+            migration (see migrations/005_case_analysis_taxonomy_alignment.sql),
+            not something inferred here.
+          * diagnosis_confidence NULL -> 0.0: the pre-alignment
+            create_case_analysis() accepted a missing confidence
+            (diagnosis_confidence was optional); the new contract requires
+            it. 0.0 is an explicit fallback sentinel for "this row predates
+            the NOT NULL requirement", never a claim that the original
+            analysis actually reported zero confidence.
+          * issue_type/issue_type_confidence did not exist before this
+            migration, so every pre-existing row gets the fixed fallback
+            ('other_or_unclear', 0.0) -- NEVER a value inferred from
+            case_title/issue_summary. A migration must not fabricate an AI
+            classification a row never actually received; the fixed
+            fallback honestly represents "this row was never classified
+            for Issue Type."
+
+        Never touches feedback_runs, sessions, cases, turns, feedback, or
+        retrieval_runs.
+        """
+        db = sqlite3.connect(self.path)
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            if not self._case_analysis_needs_taxonomy_upgrade(db):
+                return
+            db.execute("PRAGMA foreign_keys=OFF")
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    # DROP TABLE IF EXISTS guards a shadow table left over
+                    # from an earlier attempt that failed after creating
+                    # it but before this same transaction could complete
+                    # -- same defensive belt-and-suspenders as the
+                    # retrieval_runs rebuild above.
+                    db.execute("DROP TABLE IF EXISTS case_analysis_new")
+                    for statement in _CASE_ANALYSIS_REBUILD_STATEMENTS:
+                        db.execute(statement)
+                    violations = db.execute(
+                        "PRAGMA foreign_key_check(case_analysis)"
+                    ).fetchall()
+                    if violations:
+                        raise sqlite3.IntegrityError(
+                            f"case_analysis rebuild left {len(violations)} "
                             "foreign_key_check violation(s)"
                         )
                 except Exception:
@@ -1001,8 +1276,10 @@ class FeedbackStoreV2:
         *,
         case_title: str | None,
         issue_summary: str | None,
+        issue_type: str,
+        issue_type_confidence: float,
         diagnosis: str,
-        diagnosis_confidence: float | None,
+        diagnosis_confidence: float,
         product_model: str | None,
         product_source: str | None,
         product_confidence: float | None,
@@ -1017,24 +1294,55 @@ class FeedbackStoreV2:
         case_id, enforced by UNIQUE(case_id, analyzed_at)), so analysis
         history for a Case is never lost or silently overwritten.
 
-        Re-validates diagnosis/product_source in Python before attempting
-        the INSERT (fail closed, matching submit_feedback()'s convention),
-        even though the table's own CHECK constraints are the authoritative
-        backstop if this method is ever bypassed. Returns False, never
-        raises, for: an invalid diagnosis or product_source, an unknown
-        case_id (FK violation), or a duplicate (case_id, analyzed_at) pair
-        (UNIQUE violation) -- e.g. a caller retrying with the same
-        analyzed_at it already used.
+        Phase 4.5 Stage B.5 Schema Alignment: this is the storage-layer
+        boundary for the finalized tools.case_enrichment.CaseEnrichmentResult
+        contract, and re-validates every primitive value in Python before
+        attempting the INSERT (fail closed, matching submit_feedback()'s
+        convention) -- never depends on CaseEnrichmentResult.__post_init__
+        having already run, since this is a public storage boundary that
+        must defend itself regardless of caller. The table's own CHECK
+        constraints are the authoritative backstop if this method is ever
+        bypassed. Storage layer only validates primitive values/contract
+        shape -- it has no notion of CaseEnrichmentResult or any LLM
+        concept.
+
+        issue_type/issue_type_confidence/diagnosis/diagnosis_confidence are
+        all REQUIRED (never None) -- matching CaseEnrichmentResult, which
+        never leaves any of the four as None either. product_model is
+        optional; when present, product_source and product_confidence are
+        BOTH required, when absent, both must be None -- the same
+        consistency rule CaseEnrichmentResult.__post_init__ enforces at the
+        dataclass layer, now also enforced here.
+
+        Returns False, never raises, for: an invalid/out-of-range
+        issue_type, issue_type_confidence, diagnosis, diagnosis_confidence,
+        or product_confidence; an invalid product_source; a product_model/
+        product_source/product_confidence combination that violates the
+        consistency rule above; an unknown case_id (FK violation); or a
+        duplicate (case_id, analyzed_at) pair (UNIQUE violation) -- e.g. a
+        caller retrying with the same analyzed_at it already used.
 
         Does not touch cases.title / cases.product_model -- deciding
         whether/how an analysis result should update the Case's own
         identity fields is deferred to a later stage (Human Override
-        policy is explicitly out of scope for Stage A).
+        policy is explicitly out of scope for this alignment).
         """
+        if issue_type not in _ISSUE_TYPE_VALUE_SET:
+            return False
+        if not _is_valid_confidence(issue_type_confidence):
+            return False
         if diagnosis not in _DIAGNOSIS_VALUE_SET:
             return False
-        if product_source is not None and product_source not in _PRODUCT_SOURCE_VALUE_SET:
+        if not _is_valid_confidence(diagnosis_confidence):
             return False
+        if product_model is None:
+            if product_source is not None or product_confidence is not None:
+                return False
+        else:
+            if product_source is None or product_source not in _PRODUCT_SOURCE_VALUE_SET:
+                return False
+            if not _is_valid_confidence(product_confidence):
+                return False
 
         with self._connect() as db:
             try:
@@ -1042,15 +1350,17 @@ class FeedbackStoreV2:
                     """
                     INSERT INTO case_analysis (
                         analysis_id, case_id, case_title, issue_summary,
+                        issue_type, issue_type_confidence,
                         diagnosis, diagnosis_confidence,
                         product_model, product_source, product_confidence,
                         evidence_json, analysis_version, analyzed_at,
                         source_evidence_watermark
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(analysis_id), str(case_id), case_title, issue_summary,
+                        issue_type, issue_type_confidence,
                         diagnosis, diagnosis_confidence,
                         product_model, product_source, product_confidence,
                         evidence_json, str(analysis_version), str(analyzed_at),
@@ -1138,5 +1448,6 @@ __all__ = [
     "OBSERVATION_STATUSES",
     "REASON_CODES",
     "DIAGNOSIS_VALUES",
+    "ISSUE_TYPE_VALUES",
     "PRODUCT_SOURCE_VALUES",
 ]

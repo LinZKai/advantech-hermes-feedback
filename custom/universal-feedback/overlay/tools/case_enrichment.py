@@ -34,20 +34,18 @@ instead of "Negative feedback reason_code=incomplete") passes structural
 validation -- there is no content classifier here, and building one is
 explicitly out of scope for Stage B.
 
-Stage B Contract Refinement (taxonomy authority -- READ BEFORE TOUCHING
-DIAGNOSIS_VALUES): this module's DIAGNOSIS_VALUES is now DEFINED LOCALLY
-and INTENTIONALLY DIVERGES from tools.feedback_store_v2.DIAGNOSIS_VALUES
-(Stage A's case_analysis.diagnosis CHECK constraint), and this module adds
-issue_type/issue_type_confidence, for which Stage A's case_analysis table
-has NO COLUMNS at all. Nothing in Stage B persists a result
-(create_case_analysis is never called from here), so this has no
-functional effect yet -- but it is a real, tracked blocker for whichever
-later stage first tries to persist a Stage-B-produced CaseEnrichmentResult:
-today's case_analysis schema would reject 'other_or_unclear' (not in its
-CHECK list), can no longer receive 'workflow_tool_issue' (this contract
-never produces it), and has nowhere to put issue_type/issue_type_confidence
-at all. See the Stage B Contract Refinement report for the required
-follow-up (a separate Stage A schema-migration task, out of scope here).
+Taxonomy authority (Stage B.5 Schema Alignment): tools.feedback_store_v2 is
+the single authority for DIAGNOSIS_VALUES/ISSUE_TYPE_VALUES/
+PRODUCT_SOURCE_VALUES -- all three are imported from there, never
+re-declared here. (An earlier Stage B draft kept a local, deliberately
+diverging DIAGNOSIS_VALUES while the storage-layer schema had not caught up
+yet; that divergence is resolved now that tools.feedback_store_v2's
+case_analysis schema and CHECK constraints match this contract exactly --
+see that module's docstring for the migration that aligned them.) The
+per-value SEMANTICS below (what each taxonomy value practically means) are
+still documented here, next to CaseEnrichmentResult, since that is where a
+future prompt/analyzer implementation will actually need them -- only the
+authoritative value LIST moved.
 """
 from __future__ import annotations
 
@@ -56,24 +54,21 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from tools.feedback_store_v2 import PRODUCT_SOURCE_VALUES, FeedbackStoreV2
+from tools.feedback_store_v2 import (
+    DIAGNOSIS_VALUES,
+    ISSUE_TYPE_VALUES,
+    PRODUCT_SOURCE_VALUES,
+    FeedbackStoreV2,
+)
 
 logger = logging.getLogger(__name__)
 
-# Stage B Contract Refinement: deliberately NOT imported from
-# tools.feedback_store_v2 anymore. Stage A's DIAGNOSIS_VALUES (the
-# case_analysis.diagnosis CHECK constraint's taxonomy) is a 6-value set
-# that still includes 'workflow_tool_issue' and 'unclear_or_other'. This
-# refined analysis-output taxonomy has 5 values: 'workflow_tool_issue' is
-# dropped entirely, and 'unclear_or_other' is renamed to
-# 'other_or_unclear'. Importing Stage A's constant under this same name
-# would silently mix two different taxonomies together; keeping this
-# constant local, under the same name a future reader would expect, makes
-# the divergence something a diff/grep can find, and is the explicit,
-# tracked choice this module's docstring's "Stage B Contract Refinement"
-# section describes -- see that section (and the Stage B Contract
-# Refinement report) for the required Stage A follow-up before any later
-# stage persists a value from this taxonomy via create_case_analysis().
+_DIAGNOSIS_VALUE_SET = frozenset(DIAGNOSIS_VALUES)
+_ISSUE_TYPE_VALUE_SET = frozenset(ISSUE_TYPE_VALUES)
+_PRODUCT_SOURCE_VALUE_SET = frozenset(PRODUCT_SOURCE_VALUES)
+
+# Diagnosis semantics (values themselves: see DIAGNOSIS_VALUES, imported
+# above from tools.feedback_store_v2, the taxonomy authority).
 #
 # diagnosis is a CASE-LEVEL analysis result, produced for every analyzed
 # Case, not a Negative-Feedback-only field. Feedback (CaseFeedbackEvidence)
@@ -114,39 +109,23 @@ logger = logging.getLogger(__name__)
 #   no_issue_detected              - this Case has been analyzed, and
 #                                   current evidence does not show an
 #                                   AI-support issue worth improving.
-DIAGNOSIS_VALUES: tuple[str, ...] = (
-    "knowledge_gap",
-    "retrieval_issue",
-    "answer_quality_issue",
-    "other_or_unclear",
-    "no_issue_detected",
-)
-_DIAGNOSIS_VALUE_SET = frozenset(DIAGNOSIS_VALUES)
 
-_PRODUCT_SOURCE_VALUE_SET = frozenset(PRODUCT_SOURCE_VALUES)
-
-# Issue Type taxonomy: what KIND of question this Case is about -- i.e.
-# what the USER was asking. This is orthogonal to `diagnosis` (which is
-# about where the AI SUPPORT PROCESS may have fallen short, never about
-# what the user asked) -- see CaseEnrichmentResult's docstring for the
-# full orthogonality contract (no hard-coded issue_type -> diagnosis
-# mapping exists or should ever exist here). issue_type applies to EVERY
-# analyzed Case, regardless of Feedback polarity: a Case with helpful=true
-# still gets a real issue_type (and, separately, a real diagnosis -- see
-# that same docstring section for why "positive feedback" must never be
-# treated as "skip diagnosis" either). Brand new in this Contract
-# Refinement; tools.feedback_store_v2 has no counterpart constant and
-# case_analysis has no column for it yet -- same Stage A follow-up this
-# module's docstring already flags for DIAGNOSIS_VALUES. Never None: a
-# model unable to classify must emit "other_or_unclear" explicitly rather
-# than omit the field, so nothing downstream (a future dashboard, in
-# particular) has to treat a missing issue_type as a special case.
+# Issue Type semantics (values themselves: see ISSUE_TYPE_VALUES, imported
+# above from tools.feedback_store_v2, the taxonomy authority).
 #
-# Collapsed from an earlier 5-value draft (configuration_or_operation +
-# application_or_integration merged into product_usage_or_application;
-# specification_or_compatibility renamed to
-# product_capability_or_compatibility) down to 3 primary categories plus
-# one fallback:
+# Issue Type: what KIND of question this Case is about -- i.e. what the
+# USER was asking. This is orthogonal to `diagnosis` (which is about where
+# the AI SUPPORT PROCESS may have fallen short, never about what the user
+# asked) -- see CaseEnrichmentResult's docstring for the full orthogonality
+# contract (no hard-coded issue_type -> diagnosis mapping exists or should
+# ever exist here). issue_type applies to EVERY analyzed Case, regardless
+# of Feedback polarity: a Case with helpful=true still gets a real
+# issue_type (and, separately, a real diagnosis -- see the diagnosis
+# semantics above for why "positive feedback" must never be treated as
+# "skip diagnosis" either). Never None: a model unable to classify must
+# emit "other_or_unclear" explicitly rather than omit the field, so nothing
+# downstream (a future dashboard, in particular) has to treat a missing
+# issue_type as a special case.
 #
 #   product_usage_or_application         - the user is asking HOW to use,
 #                                           configure, apply, or integrate
@@ -190,13 +169,6 @@ _PRODUCT_SOURCE_VALUE_SET = frozenset(PRODUCT_SOURCE_VALUES)
 #                                           fit the three categories above.
 #                                           Never force a guess into one of
 #                                           the other three.
-ISSUE_TYPE_VALUES: tuple[str, ...] = (
-    "product_usage_or_application",
-    "product_capability_or_compatibility",
-    "product_issue",
-    "other_or_unclear",
-)
-_ISSUE_TYPE_VALUE_SET = frozenset(ISSUE_TYPE_VALUES)
 
 # Evidence source taxonomy: one entry per evidence-bearing data source
 # actually present on CaseEnrichmentInput today (turns.question_text ->
@@ -213,18 +185,16 @@ _EVIDENCE_TYPE_SET = frozenset(EVIDENCE_TYPES)
 def _is_valid_confidence(value: Any) -> bool:
     """True only for a real, finite JSON number in [0.0, 1.0].
 
-    Deliberately mirrors tools.case_routing._is_valid_confidence's exact
-    defensive logic (bool-before-int check, NaN/Infinity rejection) rather
-    than importing that private, leading-underscore helper across module
-    boundaries -- case_routing.py never exports it, so re-deriving the same
-    small, self-contained numeric check here respects that module's own
+    Deliberately mirrors tools.case_routing._is_valid_confidence's and
+    tools.feedback_store_v2._is_valid_confidence's exact defensive logic
+    (bool-before-int check, NaN/Infinity rejection) rather than importing
+    either of those private, leading-underscore helpers across a module
+    boundary -- neither module exports it, so re-deriving the same small,
+    self-contained numeric check here respects each module's own
     encapsulation choice instead of reaching past it. This is a validation
-    PATTERN, not a taxonomy-literal duplication: PRODUCT_SOURCE_VALUES is
-    still imported from tools.feedback_store_v2 below, never re-declared --
-    DIAGNOSIS_VALUES is the one deliberate exception, and it is local for a
-    different, explicitly-tracked reason (see the "Stage B Contract
-    Refinement" section of this module's docstring), not because this
-    function needed its own copy.
+    PATTERN, not a taxonomy-literal duplication -- DIAGNOSIS_VALUES/
+    ISSUE_TYPE_VALUES/PRODUCT_SOURCE_VALUES are all imported from
+    tools.feedback_store_v2 above, never re-declared.
     """
     if isinstance(value, bool):
         return False
