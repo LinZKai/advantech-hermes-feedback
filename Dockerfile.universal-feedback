@@ -639,6 +639,9 @@ COPY custom/universal-feedback/overlay/tools/feedback_mirror.py \
 COPY custom/universal-feedback/overlay/tools/case_enrichment.py \
     /opt/hermes/tools/case_enrichment.py
 
+COPY custom/universal-feedback/overlay/tools/case_enrichment_analyzer.py \
+    /opt/hermes/tools/case_enrichment_analyzer.py
+
 COPY custom/universal-feedback/overlay/tools/run_case_enrichment.py \
     /opt/hermes/tools/run_case_enrichment.py
 
@@ -673,6 +676,7 @@ RUN set -eu; \
         /opt/hermes/tools/case_routing.py \
         /opt/hermes/tools/feedback_mirror.py \
         /opt/hermes/tools/case_enrichment.py \
+        /opt/hermes/tools/case_enrichment_analyzer.py \
         /opt/hermes/tools/run_case_enrichment.py \
         /opt/hermes/migrations/001_universal_feedback.sql \
         /opt/hermes/migrations/002_feedback_schema_v2.sql \
@@ -692,9 +696,10 @@ RUN set -eu; \
         /opt/hermes/tools/case_routing.py \
         /opt/hermes/tools/feedback_mirror.py \
         /opt/hermes/tools/case_enrichment.py \
+        /opt/hermes/tools/case_enrichment_analyzer.py \
         /opt/hermes/tools/run_case_enrichment.py; \
     /opt/hermes/.venv/bin/python -c \
-        'import tools.feedback_store_v2, tools.retrieval_observer, tools.retrieval_runtime, tools.case_routing, tools.feedback_mirror, tools.case_enrichment, tools.run_case_enrichment'
+        'import tools.feedback_store_v2, tools.retrieval_observer, tools.retrieval_runtime, tools.case_routing, tools.feedback_mirror, tools.case_enrichment, tools.case_enrichment_analyzer, tools.run_case_enrichment'
 
 # END ADVANTECH UNIVERSAL FEEDBACK
 
