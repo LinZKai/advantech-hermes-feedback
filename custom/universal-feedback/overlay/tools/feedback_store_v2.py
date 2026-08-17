@@ -60,6 +60,51 @@ analysis-per-Case batch lookup) -- neither method knows about the other,
 about Reflector, or about any notion of an "analysis window"; that
 composition lives in tools.case_reflection_input, which calls both. See
 each method's own docstring for its exact semantics.
+
+Migration 006 (see ../migrations/006_reflector_proposal_domain.sql, Phase 5
+Slice 2): adds three new, purely-additive tables -- reflection_runs,
+improvement_proposals, proposal_observations. Like migration 004, this
+needs no rebuild step: every table is brand new, so CREATE TABLE IF NOT
+EXISTS is sufficient and idempotent for both a fresh database and an
+existing one already at the 002/003/004/005 shape.
+
+  * reflection_runs is a mutable batch-run record (create with
+    status='running', then a single terminal transition to 'succeeded' or
+    'failed' via complete_reflection_run()) -- NOT append-only, unlike
+    case_analysis/proposal_observations, because a run is one ongoing
+    activity with exactly one lifecycle, not a history of independent
+    snapshots. Mirrors update_turn_retrieval_observation()'s existing
+    "validated UPDATE, rowcount==1" convention -- the only other row-
+    mutation precedent already in this module.
+
+  * improvement_proposals is "identity + human lifecycle": created once,
+    per detected recurring pattern, and its review_status
+    (pending/accepted/rejected) is later moved by a HUMAN reviewer via
+    update_proposal_review_status() -- never by any AI/Reflector code
+    path. Nothing in this module enforces that boundary at the type
+    level (a Python caller could call it from anywhere); it is a process
+    boundary, documented here and in tools.reflector_proposals.
+
+  * proposal_observations is append-only, exactly like case_analysis:
+    one row per (proposal_id, reflection_run_id) pair (UNIQUE constraint,
+    same purpose as case_analysis's own append-only design -- history is
+    never lost, re-observation is always a new row), plus a second
+    UNIQUE(proposal_id, observed_at) that makes get_latest_proposal_
+    observation()/list_latest_proposal_observations()'s "ORDER BY
+    observed_at DESC" unambiguous for any one proposal_id, mirroring
+    case_analysis's own UNIQUE(case_id, analyzed_at) tie-elimination
+    exactly.
+
+This module is now also the taxonomy authority for IMPROVEMENT_TARGET_
+VALUES/REVIEW_STATUS_VALUES/PROPOSAL_TREND_VALUES/REFLECTION_RUN_STATUS_
+VALUES -- tools.reflector_proposals imports all four from here rather
+than maintaining its own copies, matching tools.case_enrichment's existing
+relationship to this module's case_analysis taxonomy constants.
+
+Slice 2 scope only: schema and storage query surface. No LLM, no matching
+algorithm, no runner, no scheduler exist yet -- see
+tools.reflector_proposals for the typed domain contracts these tables
+persist.
 """
 from __future__ import annotations
 
@@ -149,6 +194,78 @@ _ISSUE_TYPE_VALUE_SET = frozenset(ISSUE_TYPE_VALUES)
 
 PRODUCT_SOURCE_VALUES: tuple[str, ...] = ("explicit_user_text", "inference")
 _PRODUCT_SOURCE_VALUE_SET = frozenset(PRODUCT_SOURCE_VALUES)
+
+# Phase 5 Slice 2 (Cross-case Reflector proposal domain) taxonomies -- kept
+# in sync with the CHECK constraints in _SCHEMA_STATEMENTS below, same
+# fail-closed-in-Python-before-the-CHECK-fires convention as the case_
+# analysis taxonomies above. tools.reflector_proposals imports all four
+# from here rather than maintaining its own copies (see this module's
+# docstring).
+#
+# improvement_target: WHAT KIND of change a proposal is about -- never a
+# claim that Hermes/KB/Skill/SOUL may be edited automatically because of
+# it (see tools.reflector_proposals's module docstring for the explicit
+# self-improvement boundary this taxonomy value does NOT cross).
+#
+#   knowledge        - KB/FAQ/documentation may have a gap or be
+#                       insufficient.
+#   agent_behavior    - Hermes' own response strategy/instructions/
+#                       reasoning pattern may be the improvement target --
+#                       NOT permission to self-edit production behavior.
+#   retrieval          - knowledge may exist, but retrieval/query/indexing/
+#                       search behavior may be the improvement target.
+#   workflow          - tool usage, support workflow, or Case handling
+#                       process may be the improvement target.
+#   other              - does not safely fit the four categories above.
+IMPROVEMENT_TARGET_VALUES: tuple[str, ...] = (
+    "knowledge",
+    "agent_behavior",
+    "retrieval",
+    "workflow",
+    "other",
+)
+_IMPROVEMENT_TARGET_VALUE_SET = frozenset(IMPROVEMENT_TARGET_VALUES)
+
+# review_status: the HUMAN lifecycle of an ImprovementProposal -- moved
+# only by a human reviewer, never by any AI/Reflector code path (a process
+# boundary this module cannot enforce at the type level; see
+# update_proposal_review_status()'s own docstring). Deliberately only
+# three values in this slice -- 'implemented'/'resolved'/'archived' are
+# NOT added yet because the implementation workflow they would represent
+# does not exist yet (see the Phase 5 Slice 2 task instruction).
+REVIEW_STATUS_VALUES: tuple[str, ...] = (
+    "pending",
+    "accepted",
+    "rejected",
+)
+_REVIEW_STATUS_VALUE_SET = frozenset(REVIEW_STATUS_VALUES)
+
+# trend: the AI's OBSERVATION of how a pattern's supporting evidence has
+# changed since this Proposal's previous Observation -- never a claim
+# about review_status (a pattern can be trend='growing' while
+# review_status stays 'pending' forever; 'no_longer_observed' is not
+# 'rejected' -- it is an observation that current evidence no longer
+# supports the pattern as active, nothing more).
+PROPOSAL_TREND_VALUES: tuple[str, ...] = (
+    "new",
+    "growing",
+    "stable",
+    "declining",
+    "no_longer_observed",
+)
+_PROPOSAL_TREND_VALUE_SET = frozenset(PROPOSAL_TREND_VALUES)
+
+# status: a reflection_runs row's own batch lifecycle -- 'running' is the
+# only legal value create_reflection_run() ever inserts;
+# complete_reflection_run() then makes the single legal terminal
+# transition to 'succeeded' or 'failed' (never back to 'running').
+REFLECTION_RUN_STATUS_VALUES: tuple[str, ...] = (
+    "running",
+    "succeeded",
+    "failed",
+)
+_REFLECTION_RUN_STATUS_VALUE_SET = frozenset(REFLECTION_RUN_STATUS_VALUES)
+_REFLECTION_RUN_TERMINAL_STATUS_VALUE_SET = frozenset({"succeeded", "failed"})
 
 
 def _is_valid_confidence(value: Any) -> bool:
@@ -392,6 +509,110 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_case_analysis_case ON case_analysis(case_id)",
+    # Phase 5 Slice 2 (see ../migrations/006_reflector_proposal_domain.sql):
+    # a mutable batch-run record, NOT append-only -- create_reflection_run()
+    # inserts exactly one row with status='running'; complete_reflection_run()
+    # later makes the single legal terminal UPDATE to 'succeeded'/'failed'.
+    # window_start/window_end/material_change_detected/run_summary are all
+    # nullable: the first two may genuinely be unbounded (an "all Cases"
+    # run), the last two are only known once the run actually completes.
+    # analyzed_case_count is NOT NULL because by the time a caller creates
+    # this row, tools.case_reflection_input.build_reflector_input() has
+    # already run and that count is already known -- there is no
+    # "in-progress, not yet counted" state for it to represent.
+    """
+    CREATE TABLE IF NOT EXISTS reflection_runs (
+        reflection_run_id TEXT PRIMARY KEY,
+
+        window_start TEXT,
+        window_end   TEXT,
+
+        started_at   TEXT NOT NULL,
+        completed_at TEXT,
+
+        status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+
+        analyzed_case_count INTEGER NOT NULL CHECK (analyzed_case_count >= 0),
+
+        material_change_detected INTEGER CHECK (material_change_detected IN (0, 1)),
+        run_summary TEXT,
+
+        reflector_version TEXT NOT NULL
+    )
+    """,
+    # improvement_proposals: identity + HUMAN lifecycle only -- never
+    # updated by this module except review_status (via
+    # update_proposal_review_status()), and nothing in
+    # tools.reflector_proposals.ImprovementProposal carries the
+    # per-observation fields (pattern_summary, recommended_improvement,
+    # confidence, trend, ...) that change on every re-observation; those
+    # live on proposal_observations instead. created_at is set once, at
+    # INSERT, and never rewritten -- same "set once, never revisited"
+    # convention as cases.created_at (see get_case_evidence_watermark's
+    # docstring for that precedent).
+    """
+    CREATE TABLE IF NOT EXISTS improvement_proposals (
+        proposal_id TEXT PRIMARY KEY,
+
+        improvement_target TEXT NOT NULL CHECK (improvement_target IN (
+            'knowledge', 'agent_behavior', 'retrieval', 'workflow', 'other'
+        )),
+        title TEXT NOT NULL,
+
+        review_status TEXT NOT NULL CHECK (review_status IN (
+            'pending', 'accepted', 'rejected'
+        )),
+
+        created_at TEXT NOT NULL
+    )
+    """,
+    # proposal_observations: append-only, exactly like case_analysis --
+    # one row per (proposal_id, reflection_run_id) pair, never updated in
+    # place; a Proposal re-observed in a later run is always a new row.
+    # possible_cause/expected_benefit/limitations are nullable: the AI may
+    # legitimately have no supportable hypothesis/benefit/caveat to state
+    # for a given observation (see tools.reflector_proposals.
+    # ProposalObservation's docstring) -- pattern_summary and
+    # recommended_improvement are NOT NULL because an Observation with
+    # neither would carry no actionable content at all.
+    # supporting_case_ids_json is the Phase 5 Slice 2 POC shape (a JSON
+    # array of case_id strings) rather than a normalized join table -- see
+    # this migration's own doc file for why that is deliberately deferred.
+    """
+    CREATE TABLE IF NOT EXISTS proposal_observations (
+        observation_id TEXT PRIMARY KEY,
+
+        proposal_id        TEXT NOT NULL REFERENCES improvement_proposals(proposal_id),
+        reflection_run_id  TEXT NOT NULL REFERENCES reflection_runs(reflection_run_id),
+
+        trend TEXT NOT NULL CHECK (trend IN (
+            'new', 'growing', 'stable', 'declining', 'no_longer_observed'
+        )),
+
+        pattern_summary          TEXT NOT NULL,
+        possible_cause            TEXT,
+        recommended_improvement  TEXT NOT NULL,
+        expected_benefit          TEXT,
+        limitations                TEXT,
+
+        supporting_case_ids_json TEXT NOT NULL,
+        supporting_case_count    INTEGER NOT NULL CHECK (supporting_case_count >= 0),
+
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+
+        observed_at TEXT NOT NULL,
+
+        -- One Observation per Proposal per Run (the actual business
+        -- invariant -- see this migration's doc file).
+        UNIQUE (proposal_id, reflection_run_id),
+        -- Tie-elimination for get_latest_proposal_observation()'s "ORDER
+        -- BY observed_at DESC LIMIT 1", mirroring case_analysis's own
+        -- UNIQUE(case_id, analyzed_at) exactly.
+        UNIQUE (proposal_id, observed_at)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_proposal_observations_proposal ON proposal_observations(proposal_id)",
+    "CREATE INDEX IF NOT EXISTS idx_proposal_observations_run ON proposal_observations(reflection_run_id)",
 )
 
 # Migration 003 (see ../migrations/003_retrieval_execution_statuses.sql):
@@ -1569,6 +1790,329 @@ class FeedbackStoreV2:
         with self._connect() as db:
             return db.execute(query, params).fetchall()
 
+    # -- reflector proposal domain (Phase 5 Slice 2) ---------------------
+
+    def create_reflection_run(
+        self,
+        reflection_run_id: str,
+        *,
+        started_at: str,
+        analyzed_case_count: int,
+        reflector_version: str,
+        window_start: str | None = None,
+        window_end: str | None = None,
+    ) -> bool:
+        """Create one reflection_runs row with status='running' -- the
+        only legal initial status (never caller-supplied, matching how
+        create_case()/create_turn() never accept a caller-chosen initial
+        state where only one is legal). complete_reflection_run() makes
+        the single legal terminal transition later.
+
+        Returns False, never raises, for: a non-int/negative
+        analyzed_case_count, or a duplicate reflection_run_id (PRIMARY KEY
+        violation).
+        """
+        if (
+            not isinstance(analyzed_case_count, int)
+            or isinstance(analyzed_case_count, bool)
+            or analyzed_case_count < 0
+        ):
+            return False
+
+        with self._connect() as db:
+            try:
+                db.execute(
+                    """
+                    INSERT INTO reflection_runs (
+                        reflection_run_id, window_start, window_end,
+                        started_at, completed_at, status,
+                        analyzed_case_count, material_change_detected,
+                        run_summary, reflector_version
+                    ) VALUES (?, ?, ?, ?, NULL, 'running', ?, NULL, NULL, ?)
+                    """,
+                    (
+                        str(reflection_run_id), window_start, window_end,
+                        str(started_at), int(analyzed_case_count), str(reflector_version),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def complete_reflection_run(
+        self,
+        reflection_run_id: str,
+        *,
+        status: str,
+        completed_at: str,
+        material_change_detected: bool | None = None,
+        run_summary: str | None = None,
+    ) -> bool:
+        """Make the single legal terminal UPDATE for a reflection_runs row:
+        status must be 'succeeded' or 'failed' -- never 'running' again.
+        The WHERE clause only ever matches a row that is CURRENTLY
+        status='running', so this can never re-complete an
+        already-terminal row.
+
+        Mirrors update_turn_retrieval_observation()'s existing "validated
+        UPDATE, rowcount==1" convention -- the only other row-mutation
+        precedent already in this module. Returns False, never raises,
+        for: an invalid status (not 'succeeded'/'failed'), an unknown
+        reflection_run_id, or a reflection_run_id that is not currently
+        'running' (already completed once, or never existed).
+        """
+        if status not in _REFLECTION_RUN_TERMINAL_STATUS_VALUE_SET:
+            return False
+
+        with self._connect() as db:
+            cur = db.execute(
+                """
+                UPDATE reflection_runs
+                SET status=?, completed_at=?, material_change_detected=?, run_summary=?
+                WHERE reflection_run_id=? AND status='running'
+                """,
+                (
+                    status, str(completed_at),
+                    None if material_change_detected is None else int(bool(material_change_detected)),
+                    run_summary, str(reflection_run_id),
+                ),
+            )
+            return cur.rowcount == 1
+
+    def get_reflection_run(self, reflection_run_id: str) -> sqlite3.Row | None:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM reflection_runs WHERE reflection_run_id=?", (reflection_run_id,)
+            ).fetchone()
+
+    def create_improvement_proposal(
+        self,
+        proposal_id: str,
+        *,
+        improvement_target: str,
+        title: str,
+        created_at: str,
+    ) -> bool:
+        """Create one improvement_proposals row with review_status='pending'
+        -- the only legal initial review_status (a freshly detected
+        Proposal has not yet been reviewed by anyone; never caller-
+        supplied, same "only one legal initial value" reasoning as
+        create_reflection_run()'s status='running').
+
+        Returns False, never raises, for: an invalid improvement_target, a
+        blank title, or a duplicate proposal_id (PRIMARY KEY violation).
+        """
+        if improvement_target not in _IMPROVEMENT_TARGET_VALUE_SET:
+            return False
+        if not isinstance(title, str) or not title.strip():
+            return False
+
+        with self._connect() as db:
+            try:
+                db.execute(
+                    """
+                    INSERT INTO improvement_proposals (
+                        proposal_id, improvement_target, title, review_status, created_at
+                    ) VALUES (?, ?, ?, 'pending', ?)
+                    """,
+                    (str(proposal_id), improvement_target, title, str(created_at)),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def get_improvement_proposal(self, proposal_id: str) -> sqlite3.Row | None:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM improvement_proposals WHERE proposal_id=?", (proposal_id,)
+            ).fetchone()
+
+    def list_improvement_proposals(self, *, review_status: str | None = None) -> list[sqlite3.Row]:
+        """Every improvement_proposals row, oldest (created_at) first.
+        review_status optionally scopes to one review status -- an invalid
+        value returns [] rather than raising, matching list_cases_
+        needing_analysis's own optional-filter convention (session_id).
+        """
+        if review_status is not None and review_status not in _REVIEW_STATUS_VALUE_SET:
+            return []
+        query = "SELECT * FROM improvement_proposals"
+        params: list[Any] = []
+        if review_status is not None:
+            query += " WHERE review_status=?"
+            params.append(review_status)
+        query += " ORDER BY created_at"
+        with self._connect() as db:
+            return db.execute(query, params).fetchall()
+
+    def update_proposal_review_status(self, proposal_id: str, review_status: str) -> bool:
+        """The HUMAN review action -- move an improvement_proposals row's
+        review_status. This module has no notion of "who" is calling it;
+        the process boundary (a human reviewer only, never an AI/
+        Reflector code path) is documented, not type-enforced here -- see
+        this module's own docstring and tools.reflector_proposals's
+        self-improvement boundary section.
+
+        Mirrors update_turn_retrieval_observation()'s "validated UPDATE,
+        rowcount==1" convention. Returns False, never raises, for an
+        invalid review_status or an unknown proposal_id.
+        """
+        if review_status not in _REVIEW_STATUS_VALUE_SET:
+            return False
+        with self._connect() as db:
+            cur = db.execute(
+                "UPDATE improvement_proposals SET review_status=? WHERE proposal_id=?",
+                (review_status, str(proposal_id)),
+            )
+            return cur.rowcount == 1
+
+    def create_proposal_observation(
+        self,
+        observation_id: str,
+        proposal_id: str,
+        reflection_run_id: str,
+        *,
+        trend: str,
+        pattern_summary: str,
+        possible_cause: str | None,
+        recommended_improvement: str,
+        expected_benefit: str | None,
+        limitations: str | None,
+        supporting_case_ids_json: str,
+        supporting_case_count: int,
+        confidence: float,
+        observed_at: str,
+    ) -> bool:
+        """Insert one Observation row for a Proposal. Append-only: this
+        never updates a prior row -- a Proposal re-observed in a later
+        Reflection Run is always a new row (UNIQUE(proposal_id,
+        reflection_run_id) enforces at most one Observation per Proposal
+        per Run; UNIQUE(proposal_id, observed_at) additionally guarantees
+        get_latest_proposal_observation()'s ordering is never ambiguous),
+        matching create_case_analysis()'s exact append-only convention.
+
+        Re-validates every primitive value in Python before attempting the
+        INSERT (fail closed, matching create_case_analysis()'s own
+        convention) -- never depends on tools.reflector_proposals.
+        ProposalObservation.__post_init__ having already run, since this
+        is a public storage boundary that must defend itself regardless of
+        caller. The table's own CHECK constraints are the authoritative
+        backstop if this method is ever bypassed.
+
+        Cross-field rules (trend='no_longer_observed' may have
+        supporting_case_count=0, every other trend may not) are NOT
+        re-checked here -- matching how create_case_analysis() itself
+        never re-derives its own product_model/source/confidence
+        consistency rule at the SQL/CHECK level either; single-column
+        CHECK constraints are the DB-level backstop, cross-field
+        consistency is the dataclass layer's job
+        (tools.reflector_proposals.ProposalObservation.__post_init__).
+
+        Returns False, never raises, for: an invalid trend, a blank
+        pattern_summary/recommended_improvement, an invalid confidence, a
+        non-int/negative supporting_case_count, an unknown proposal_id or
+        reflection_run_id (FK violation), or a duplicate
+        (proposal_id, reflection_run_id) or (proposal_id, observed_at)
+        pair (UNIQUE violation).
+        """
+        if trend not in _PROPOSAL_TREND_VALUE_SET:
+            return False
+        if not isinstance(pattern_summary, str) or not pattern_summary.strip():
+            return False
+        if not isinstance(recommended_improvement, str) or not recommended_improvement.strip():
+            return False
+        if not _is_valid_confidence(confidence):
+            return False
+        if (
+            not isinstance(supporting_case_count, int)
+            or isinstance(supporting_case_count, bool)
+            or supporting_case_count < 0
+        ):
+            return False
+
+        with self._connect() as db:
+            try:
+                db.execute(
+                    """
+                    INSERT INTO proposal_observations (
+                        observation_id, proposal_id, reflection_run_id,
+                        trend, pattern_summary, possible_cause,
+                        recommended_improvement, expected_benefit, limitations,
+                        supporting_case_ids_json, supporting_case_count,
+                        confidence, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(observation_id), str(proposal_id), str(reflection_run_id),
+                        trend, pattern_summary, possible_cause,
+                        recommended_improvement, expected_benefit, limitations,
+                        str(supporting_case_ids_json), int(supporting_case_count),
+                        confidence, str(observed_at),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def get_latest_proposal_observation(self, proposal_id: str) -> sqlite3.Row | None:
+        """The most recent proposal_observations row for this proposal_id
+        (by observed_at), or None if this Proposal has never been
+        observed. Unambiguous by construction, mirroring
+        get_latest_case_analysis()'s own reasoning: UNIQUE(proposal_id,
+        observed_at) means two rows for the SAME proposal_id can never
+        share the same observed_at.
+        """
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM proposal_observations WHERE proposal_id=? ORDER BY observed_at DESC LIMIT 1",
+                (proposal_id,),
+            ).fetchone()
+
+    def list_latest_proposal_observations(
+        self, *, proposal_ids: Collection[str] | None = None
+    ) -> list[sqlite3.Row]:
+        """Every Proposal's most recent proposal_observations row, one row
+        per proposal_id -- the batch counterpart to
+        get_latest_proposal_observation(), mirroring list_latest_case_
+        analysis()'s exact shape and None-vs-empty-collection semantics:
+        this is what a future "Proposal + latest Observation" default view
+        (see the Phase 5 Slice 2 task instruction, section 2) reads.
+
+        proposal_ids=None returns the latest row for every Proposal that
+        has EVER been observed. proposal_ids=<empty collection> is
+        explicit input, not "no filter": it deterministically returns []
+        without ever querying the database -- an empty collection must
+        never be silently reinterpreted as "proposal_ids was omitted".
+
+        Ordering is deterministic: proposal_id ascending.
+        """
+        if proposal_ids is not None and not proposal_ids:
+            return []
+
+        query = """
+            SELECT proposal_observations.*
+            FROM proposal_observations
+            INNER JOIN (
+                SELECT proposal_id, MAX(observed_at) AS latest_observed_at
+                FROM proposal_observations
+                {where}
+                GROUP BY proposal_id
+            ) latest
+              ON proposal_observations.proposal_id = latest.proposal_id
+             AND proposal_observations.observed_at = latest.latest_observed_at
+            ORDER BY proposal_observations.proposal_id ASC
+        """
+        params: list[Any] = []
+        if proposal_ids is None:
+            query = query.format(where="")
+        else:
+            ids = list(proposal_ids)
+            placeholders = ",".join("?" for _ in ids)
+            query = query.format(where=f"WHERE proposal_id IN ({placeholders})")
+            params.extend(ids)
+
+        with self._connect() as db:
+            return db.execute(query, params).fetchall()
+
 
 __all__ = [
     "FeedbackStoreV2",
@@ -1579,4 +2123,8 @@ __all__ = [
     "DIAGNOSIS_VALUES",
     "ISSUE_TYPE_VALUES",
     "PRODUCT_SOURCE_VALUES",
+    "IMPROVEMENT_TARGET_VALUES",
+    "REVIEW_STATUS_VALUES",
+    "PROPOSAL_TREND_VALUES",
+    "REFLECTION_RUN_STATUS_VALUES",
 ]
