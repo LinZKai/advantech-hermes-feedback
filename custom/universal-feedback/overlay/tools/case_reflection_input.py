@@ -1,0 +1,479 @@
+"""Phase 5 Slice 1: the Cross-case Reflector input contract.
+
+    FeedbackStoreV2
+     |
+     v
+    list_case_ids_created_in_window()   (tools.feedback_store_v2, unchanged)
+     |
+     v
+    list_latest_case_analysis()         (tools.feedback_store_v2, unchanged)
+     |
+     v
+    _build_case_intelligence_record()   (this module -- parse/validate each
+     |                                    row, or classify the gap)
+     v
+    deterministic aggregation           (this module -- pure counting)
+     |
+     v
+    ReflectorInput
+
+Slice 1 scope only: assemble the deterministic input a future Reflector LLM
+call needs. No LLM call, no prompt, no ImprovementProposal, no persistence,
+no scheduler -- those are later slices. Storage queries stay in
+tools.feedback_store_v2 -- this module issues no raw SQL of its own,
+matching tools.case_enrichment's own "glue, not storage" layering (see that
+module's docstring).
+
+Case identity is session-scoped (confirmed by a prior read-only audit):
+Case Routing never merges Cases across Sessions, and cases.created_at is
+set once, at Case creation, and never rewritten -- so it reliably means
+"this independent Case occurrence began at this time" (see
+tools.feedback_store_v2.FeedbackStoreV2.create_case /
+list_case_ids_created_in_window). This module's analysis window is always
+a cases.created_at range -- never cases.updated_at (that column is never
+actually updated by anything, see get_case_evidence_watermark's docstring)
+and never case_analysis.source_evidence_watermark (that field's
+responsibility stays Case Enrichment staleness, not Case occurrence time).
+
+Cross-Case pattern detection itself (similarity, recurrence, proposals) is
+explicitly NOT this module's job -- this module only assembles the
+deterministic facts a future Reflector LLM step will reason over.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import math
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
+
+from tools.case_enrichment import CaseAnalysisEvidence
+from tools.feedback_store_v2 import (
+    DIAGNOSIS_VALUES,
+    FeedbackStoreV2,
+    ISSUE_TYPE_VALUES,
+    PRODUCT_SOURCE_VALUES,
+)
+
+logger = logging.getLogger(__name__)
+
+_ISSUE_TYPE_VALUE_SET = frozenset(ISSUE_TYPE_VALUES)
+_DIAGNOSIS_VALUE_SET = frozenset(DIAGNOSIS_VALUES)
+_PRODUCT_SOURCE_VALUE_SET = frozenset(PRODUCT_SOURCE_VALUES)
+
+# Deterministic bucket key for a Case whose latest case_analysis has
+# product_model=None -- chosen to be a value no real product model string
+# could plausibly collide with (dunder-wrapped), matching the sentinel
+# style already used elsewhere in this codebase for "this is a fixed marker,
+# never a real observed value" (see e.g. tools.feedback_store_v2's fixed
+# _RETRIEVAL_INSERT_FAILED_REASON reason string).
+UNKNOWN_PRODUCT_MODEL_BUCKET = "__unknown__"
+
+_EVIDENCE_REQUIRED_KEYS = frozenset({"type", "turn_id", "fact"})
+
+
+def _is_valid_confidence(value: Any) -> bool:
+    """True only for a real, finite number in [0.0, 1.0].
+
+    Deliberately its own local copy rather than importing tools.
+    feedback_store_v2._is_valid_confidence or
+    tools.case_enrichment._is_valid_confidence -- neither module exports
+    it, and both of those modules already independently keep their own
+    copy of this exact check rather than reaching across a module
+    boundary at a private, leading-underscore helper (see each of their
+    own docstrings for this same reasoning). This module follows the same
+    established convention.
+    """
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return False
+    return 0.0 <= value <= 1.0
+
+
+def _require_nonblank_str(value: Any, field_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-blank string, got {value!r}")
+
+
+# ---------------------------------------------------------------------------
+# Case Intelligence record -- one Case's latest case_analysis, typed
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CaseIntelligenceRecord:
+    """One Case's latest case_analysis row, reconstructed into a typed,
+    validated shape -- never a raw sqlite3.Row exposed as part of the
+    ReflectorInput public contract.
+
+    Structurally re-validates every field against the same taxonomies/
+    ranges tools.feedback_store_v2.create_case_analysis() and
+    tools.case_enrichment.CaseEnrichmentResult already enforce at WRITE
+    time -- belt-and-suspenders, matching the established convention that
+    every boundary in this codebase defends itself rather than trusting an
+    upstream layer unconditionally (see create_case_analysis()'s own
+    docstring: "never depends on CaseEnrichmentResult.__post_init__ having
+    already run ... this is a public storage boundary that must defend
+    itself regardless of caller"). This is the read-side mirror of that
+    same principle.
+
+    Unlike CaseEnrichmentResult (the write-time contract, which requires
+    at least one evidence entry -- see that class's docstring), `evidence`
+    here MAY be empty: case_analysis.evidence_json is a nullable TEXT
+    column with no non-empty constraint at the storage layer, so a row
+    written directly through FeedbackStoreV2.create_case_analysis()
+    (bypassing the analyzer, e.g. in a test) can legitimately have no
+    evidence recorded. Read-time reconstruction must not reject a row the
+    storage layer itself already accepted as valid.
+    """
+
+    case_id: str
+    case_title: str | None
+    issue_summary: str | None
+    product_model: str | None
+    product_source: str | None
+    product_confidence: float | None
+    issue_type: str
+    issue_type_confidence: float
+    diagnosis: str
+    diagnosis_confidence: float
+    evidence: tuple[CaseAnalysisEvidence, ...]
+    analysis_version: str
+    analyzed_at: str
+    source_evidence_watermark: str
+
+    def __post_init__(self) -> None:
+        _require_nonblank_str(self.case_id, "case_id")
+
+        if self.case_title is not None and not isinstance(self.case_title, str):
+            raise ValueError("case_title must be a string or None")
+        if self.issue_summary is not None and not isinstance(self.issue_summary, str):
+            raise ValueError("issue_summary must be a string or None")
+
+        if self.issue_type not in _ISSUE_TYPE_VALUE_SET:
+            raise ValueError(f"invalid issue_type: {self.issue_type!r}")
+        if not _is_valid_confidence(self.issue_type_confidence):
+            raise ValueError(f"invalid issue_type_confidence: {self.issue_type_confidence!r}")
+
+        if self.diagnosis not in _DIAGNOSIS_VALUE_SET:
+            raise ValueError(f"invalid diagnosis: {self.diagnosis!r}")
+        if not _is_valid_confidence(self.diagnosis_confidence):
+            raise ValueError(f"invalid diagnosis_confidence: {self.diagnosis_confidence!r}")
+
+        if self.product_model is None:
+            if self.product_source is not None:
+                raise ValueError("product_source must be None when product_model is None")
+            if self.product_confidence is not None:
+                raise ValueError("product_confidence must be None when product_model is None")
+        else:
+            _require_nonblank_str(self.product_model, "product_model")
+            if self.product_source not in _PRODUCT_SOURCE_VALUE_SET:
+                raise ValueError(f"invalid product_source: {self.product_source!r}")
+            if not _is_valid_confidence(self.product_confidence):
+                raise ValueError(f"invalid product_confidence: {self.product_confidence!r}")
+
+        if not isinstance(self.evidence, tuple) or not all(
+            isinstance(item, CaseAnalysisEvidence) for item in self.evidence
+        ):
+            raise ValueError("evidence must be a tuple of CaseAnalysisEvidence")
+
+        _require_nonblank_str(self.analysis_version, "analysis_version")
+        _require_nonblank_str(self.analyzed_at, "analyzed_at")
+        _require_nonblank_str(self.source_evidence_watermark, "source_evidence_watermark")
+
+
+def _parse_evidence_json(evidence_json: str | None) -> tuple[CaseAnalysisEvidence, ...] | None:
+    """Parse case_analysis.evidence_json into a tuple of CaseAnalysisEvidence,
+    or None if it is present but malformed.
+
+    None (the column's own "no evidence recorded" state -- see
+    CaseIntelligenceRecord's docstring) maps to an empty tuple, never to a
+    parse failure -- a missing value is not the same as an invalid one.
+    Any other problem (invalid JSON, wrong root type, an item with the
+    wrong keys, or an item that fails CaseAnalysisEvidence's own
+    __post_init__) returns None so the caller can classify this Case's
+    latest analysis as unparseable rather than silently dropping or
+    guessing at its evidence -- mirrors tools.case_enrichment.
+    parse_case_enrichment_result's exact evidence-parsing shape (same
+    required-keys check, same "never raises" contract).
+    """
+    if evidence_json is None:
+        return ()
+    try:
+        parsed = json.loads(evidence_json)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+
+    items: list[CaseAnalysisEvidence] = []
+    try:
+        for item in parsed:
+            if not isinstance(item, Mapping) or set(item.keys()) != _EVIDENCE_REQUIRED_KEYS:
+                return None
+            items.append(CaseAnalysisEvidence(
+                type=item.get("type"), turn_id=item.get("turn_id"), fact=item.get("fact"),
+            ))
+    except (ValueError, TypeError):
+        return None
+    return tuple(items)
+
+
+def _build_case_intelligence_record(row: Any) -> CaseIntelligenceRecord | None:
+    """Reconstruct one CaseIntelligenceRecord from one
+    list_latest_case_analysis() row, or None if it fails to parse/validate.
+
+    Never raises -- fail closed, matching tools.case_enrichment.
+    build_case_enrichment_input's own "returns None, never raises" contract
+    for a single unbuildable unit. The caller (build_reflector_input) is
+    responsible for recording which case_id this was for, in
+    ReflectorInput.cases_with_unparseable_analysis -- this function itself
+    has no case_id-tracking responsibility beyond logging.
+    """
+    evidence = _parse_evidence_json(row["evidence_json"])
+    if evidence is None:
+        logger.debug(
+            "case_analysis row for case %r has unparseable evidence_json", row["case_id"],
+        )
+        return None
+    try:
+        return CaseIntelligenceRecord(
+            case_id=row["case_id"],
+            case_title=row["case_title"],
+            issue_summary=row["issue_summary"],
+            product_model=row["product_model"],
+            product_source=row["product_source"],
+            product_confidence=row["product_confidence"],
+            issue_type=row["issue_type"],
+            issue_type_confidence=row["issue_type_confidence"],
+            diagnosis=row["diagnosis"],
+            diagnosis_confidence=row["diagnosis_confidence"],
+            evidence=evidence,
+            analysis_version=row["analysis_version"],
+            analyzed_at=row["analyzed_at"],
+            source_evidence_watermark=row["source_evidence_watermark"],
+        )
+    except (ValueError, TypeError):
+        logger.debug(
+            "case_analysis row for case %r failed CaseIntelligenceRecord validation",
+            row["case_id"], exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ReflectorInput -- the Slice 1 output contract
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReflectorInput:
+    """One Reflector analysis window's full deterministic input.
+
+    `window_start`/`window_end` are the exact bounds passed to
+    build_reflector_input() (ISO-8601 strings, or None), carried through
+    unchanged for traceability -- window_start is INCLUSIVE, window_end is
+    EXCLUSIVE, matching FeedbackStoreV2.list_case_ids_created_in_window's
+    own [start, end) contract exactly (this module does not re-derive or
+    reinterpret that boundary rule, only repeats it).
+
+    `cases` holds every window Case's CaseIntelligenceRecord that was
+    successfully reconstructed -- this is the actual Case Intelligence a
+    future Reflector LLM step reads, not just aggregate counts (Phase 5
+    task instruction: "不要只保留 aggregate counts").
+
+    Two gap-tracking fields make missing/broken data structurally
+    impossible to miss (never silently dropped -- see
+    build_reflector_input's docstring for the full reasoning):
+      * `cases_missing_analysis` -- case_id of every window Case with NO
+        case_analysis row at all yet.
+      * `cases_with_unparseable_analysis` -- case_id of every window Case
+        whose latest case_analysis row exists but failed to reconstruct
+        into a valid CaseIntelligenceRecord.
+    Neither bucket is included in `cases`, `total_cases`, or any by_*
+    aggregation.
+
+    `total_cases`/`by_product_model`/`by_issue_type`/`by_diagnosis` are
+    computed ONLY over `cases` -- pure counting, no interpretation. by_*
+    values are immutable (types.MappingProxyType) and key-sorted for
+    deterministic iteration; by_product_model uses
+    UNKNOWN_PRODUCT_MODEL_BUCKET for a Case with product_model=None.
+
+    Deliberately carries no LLM behavior, no persistence, no scheduler
+    concept -- exactly the same "contract only, no side effects" shape as
+    tools.case_enrichment.CaseEnrichmentInput.
+    """
+
+    window_start: str | None
+    window_end: str | None
+    cases: tuple[CaseIntelligenceRecord, ...]
+    cases_missing_analysis: tuple[str, ...]
+    cases_with_unparseable_analysis: tuple[str, ...]
+    total_cases: int
+    by_product_model: Mapping[str, int]
+    by_issue_type: Mapping[str, int]
+    by_diagnosis: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        if self.window_start is not None and not isinstance(self.window_start, str):
+            raise ValueError("window_start must be a string or None")
+        if self.window_end is not None and not isinstance(self.window_end, str):
+            raise ValueError("window_end must be a string or None")
+
+        if not isinstance(self.cases, tuple) or not all(
+            isinstance(c, CaseIntelligenceRecord) for c in self.cases
+        ):
+            raise ValueError("cases must be a tuple of CaseIntelligenceRecord")
+        if not isinstance(self.cases_missing_analysis, tuple) or not all(
+            isinstance(c, str) for c in self.cases_missing_analysis
+        ):
+            raise ValueError("cases_missing_analysis must be a tuple of str")
+        if not isinstance(self.cases_with_unparseable_analysis, tuple) or not all(
+            isinstance(c, str) for c in self.cases_with_unparseable_analysis
+        ):
+            raise ValueError("cases_with_unparseable_analysis must be a tuple of str")
+
+        if self.total_cases != len(self.cases):
+            raise ValueError(
+                f"total_cases ({self.total_cases}) must equal len(cases) ({len(self.cases)})"
+            )
+
+        for name, mapping in (
+            ("by_product_model", self.by_product_model),
+            ("by_issue_type", self.by_issue_type),
+            ("by_diagnosis", self.by_diagnosis),
+        ):
+            if not isinstance(mapping, Mapping):
+                raise ValueError(f"{name} must be a Mapping")
+            total = sum(mapping.values())
+            if total != self.total_cases:
+                raise ValueError(
+                    f"{name} counts ({total}) must sum to total_cases ({self.total_cases})"
+                )
+
+
+def _count_by(
+    records: list[CaseIntelligenceRecord], key_fn: Callable[[CaseIntelligenceRecord], str]
+) -> Mapping[str, int]:
+    """Deterministic, immutable frequency count of key_fn(record) across
+    records -- key-sorted so iteration order never depends on insertion
+    order or dict hash randomization."""
+    counts: dict[str, int] = {}
+    for record in records:
+        key = key_fn(record)
+        counts[key] = counts.get(key, 0) + 1
+    return MappingProxyType(dict(sorted(counts.items())))
+
+
+def build_reflector_input(
+    store: FeedbackStoreV2,
+    *,
+    window_start: str | None = None,
+    window_end: str | None = None,
+) -> ReflectorInput:
+    """Assemble one Reflector analysis window's full deterministic input.
+
+        list_case_ids_created_in_window()
+                |
+                v
+        list_latest_case_analysis(case_ids=...)
+                |
+                v
+        parse/validate each row -> CaseIntelligenceRecord, or classify the
+        gap (missing analysis / unparseable analysis)
+                |
+                v
+        deterministic aggregation (total_cases / by_product_model /
+        by_issue_type / by_diagnosis)
+                |
+                v
+        ReflectorInput
+
+    Uses only tools.feedback_store_v2.FeedbackStoreV2 query methods -- no
+    raw SQL in this module, matching tools.case_enrichment's own "Storage
+    queries stay in tools.feedback_store_v2" convention (see that module's
+    docstring).
+
+    Missing-analysis handling: a Case whose creation time falls inside
+    [window_start, window_end) but that has never been analyzed (no
+    case_analysis row at all) is NEVER silently dropped -- its case_id is
+    recorded in ReflectorInput.cases_missing_analysis. Likewise a Case
+    whose latest case_analysis row exists but fails to reconstruct into a
+    valid CaseIntelligenceRecord (malformed evidence_json, or a value that
+    no longer matches the current taxonomy) is recorded in
+    ReflectorInput.cases_with_unparseable_analysis, never merged into
+    `cases` and never dropped without a trace. `total_cases` and every
+    by_* aggregation are computed ONLY over `cases` (the successfully
+    reconstructed records).
+
+    This function deliberately does NOT hard-fail the whole build when
+    some window Cases lack analysis. The normal Phase 5 batch cycle already
+    runs Case Enrichment immediately before Reflector, but
+    tools.run_case_enrichment.py's own per-Case outcome handling
+    (build_failed/analyze_failed/persist_failed -- see that module's
+    _process_case) proves a real production batch can legitimately leave
+    some Cases unanalyzed even in an otherwise-healthy run; aborting the
+    entire Reflector input for one such gap would make the whole pipeline
+    fragile for no real safety benefit, and this codebase has no existing
+    precedent for a hard batch-level failure mode at this layer. Instead,
+    the gap is made a first-class, impossible-to-miss field on the
+    returned contract -- satisfying "never silently drop" without
+    inventing a new failure mode.
+
+    Does not catch exceptions raised by the store.* calls themselves -- a
+    real database/connectivity failure propagates to the caller unchanged,
+    matching every FeedbackStoreV2 query method this composes, none of
+    which swallow their own DB errors. There is no meaningful "empty
+    ReflectorInput" fallback for a DB failure that would not misrepresent
+    an error as "zero Cases in this window".
+    """
+    case_ids = store.list_case_ids_created_in_window(
+        created_from=window_start, created_before=window_end,
+    )
+    analysis_rows = store.list_latest_case_analysis(case_ids=case_ids)
+
+    records: list[CaseIntelligenceRecord] = []
+    unparseable: list[str] = []
+    analyzed_case_ids: set[str] = set()
+    for row in analysis_rows:
+        analyzed_case_ids.add(row["case_id"])
+        record = _build_case_intelligence_record(row)
+        if record is None:
+            unparseable.append(row["case_id"])
+        else:
+            records.append(record)
+
+    missing = sorted(cid for cid in case_ids if cid not in analyzed_case_ids)
+    records.sort(key=lambda r: r.case_id)
+    unparseable.sort()
+
+    by_product_model = _count_by(
+        records,
+        lambda r: r.product_model if r.product_model is not None else UNKNOWN_PRODUCT_MODEL_BUCKET,
+    )
+    by_issue_type = _count_by(records, lambda r: r.issue_type)
+    by_diagnosis = _count_by(records, lambda r: r.diagnosis)
+
+    return ReflectorInput(
+        window_start=window_start,
+        window_end=window_end,
+        cases=tuple(records),
+        cases_missing_analysis=tuple(missing),
+        cases_with_unparseable_analysis=tuple(unparseable),
+        total_cases=len(records),
+        by_product_model=by_product_model,
+        by_issue_type=by_issue_type,
+        by_diagnosis=by_diagnosis,
+    )
+
+
+__all__ = [
+    "UNKNOWN_PRODUCT_MODEL_BUCKET",
+    "CaseIntelligenceRecord",
+    "ReflectorInput",
+    "build_reflector_input",
+]

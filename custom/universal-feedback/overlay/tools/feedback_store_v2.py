@@ -50,6 +50,16 @@ CHECK constraint and tightens existing columns to NOT NULL, not just adds
 new tables. See _upgrade_case_analysis_taxonomy() below for the legacy-data
 handling this rebuild applies (never a silent guess at Issue Type for
 pre-existing rows -- see that method's docstring).
+
+Phase 5 Slice 1 (Cross-case Reflector input foundation): adds two new
+read-only query methods, list_case_ids_created_in_window() and
+list_latest_case_analysis() -- no schema change, no migration; both tables
+they read (cases, case_analysis) are unchanged. Each is a general-purpose,
+single-responsibility primitive (Case-creation-time filtering; latest-
+analysis-per-Case batch lookup) -- neither method knows about the other,
+about Reflector, or about any notion of an "analysis window"; that
+composition lives in tools.case_reflection_input, which calls both. See
+each method's own docstring for its exact semantics.
 """
 from __future__ import annotations
 
@@ -59,7 +69,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection
 
 from tools.feedback_callbacks import REASON_CODES, is_valid_reason_code
 from tools.feedback_storage import DEFAULT_PATH, MAX_SUGGESTION_TEXT_LENGTH
@@ -1436,6 +1446,125 @@ class FeedbackStoreV2:
         if limit is not None:
             query += " LIMIT ?"
             params.append(int(limit))
+
+        with self._connect() as db:
+            return db.execute(query, params).fetchall()
+
+    # -- case reflection input (Phase 5 Slice 1) -------------------------
+
+    def list_case_ids_created_in_window(
+        self,
+        *,
+        created_from: str | None = None,
+        created_before: str | None = None,
+    ) -> list[str]:
+        """Every case_id whose cases.created_at falls in
+        [created_from, created_before) -- a pure Case-identity/creation-time
+        filter. Does not touch case_analysis, evidence, or any other table;
+        has no notion of "stale", "analyzed", or Reflector.
+
+        Half-open window, matching the conventional [start, end) shape:
+        created_from is INCLUSIVE (created_at >= created_from),
+        created_before is EXCLUSIVE (created_at < created_before) -- so two
+        adjacent windows (e.g. consecutive weekly batches) never overlap
+        and never leave a gap at the shared boundary timestamp.
+
+        created_from=None means no lower bound; created_before=None means
+        no upper bound; both None returns every Case's id. Comparison is
+        lexical TEXT comparison against the same ISO-8601
+        (datetime.now(timezone.utc).isoformat(), fixed UTC offset) shape
+        every other *_at column in this module already uses -- see
+        get_case_evidence_watermark's docstring for why plain string
+        comparison is safe for this timestamp shape.
+
+        Deliberately does NOT know about case_analysis: this is the
+        Case-occurrence-window half of a two-query composition with
+        list_latest_case_analysis (its Case-analysis-snapshot counterpart,
+        see that method's docstring) -- a caller wanting "latest analysis
+        for Cases created in this window" composes both explicitly. Kept
+        this way so this method stays a general-purpose Case-identity
+        primitive a future Dashboard (or any other caller with a reason to
+        filter Cases by creation time, unrelated to case_analysis) can
+        reuse directly, rather than only being reachable through a
+        Reflector-shaped combined query.
+
+        Ordering is deterministic: created_at ascending, then case_id
+        ascending as the tiebreaker (unlike case_analysis.analyzed_at,
+        cases.created_at carries no UNIQUE constraint, so two different
+        Cases really can share the same created_at).
+        """
+        query = "SELECT case_id FROM cases WHERE 1=1"
+        params: list[Any] = []
+        if created_from is not None:
+            query += " AND created_at >= ?"
+            params.append(created_from)
+        if created_before is not None:
+            query += " AND created_at < ?"
+            params.append(created_before)
+        query += " ORDER BY created_at ASC, case_id ASC"
+
+        with self._connect() as db:
+            return [row["case_id"] for row in db.execute(query, params).fetchall()]
+
+    def list_latest_case_analysis(
+        self, *, case_ids: Collection[str] | None = None
+    ) -> list[sqlite3.Row]:
+        """Every Case's most recent case_analysis row (by analyzed_at), one
+        row per case_id -- the batch counterpart to get_latest_case_analysis
+        (which serves a single case_id). Same "latest" semantics as that
+        method: UNIQUE(case_id, analyzed_at) makes MAX(analyzed_at) per
+        case_id unambiguous, so a Case's historical (superseded) analysis
+        rows can never be double-counted alongside its current one here
+        either.
+
+        case_ids=None (the default) returns the latest row for every Case
+        that has EVER been analyzed (i.e. every distinct case_id present in
+        case_analysis) -- a Case that has never been analyzed contributes no
+        row, exactly like get_latest_case_analysis(case_id) returns None for
+        it. case_ids=<empty collection> is explicit input, not "no filter":
+        it deterministically returns [] without ever querying the database
+        -- an empty collection must never be silently reinterpreted as
+        "case_ids was omitted". This mirrors the None-vs-explicitly-empty
+        distinction tools.retrieval_runtime.persist_turn_and_retrieval
+        already establishes for its own candidate_case_ids parameter (see
+        that function's docstring): omitted and explicitly-empty are two
+        different, both meaningful, inputs.
+
+        Deliberately does NOT know about cases.created_at, any notion of an
+        analysis "window", or Reflector -- this is a general-purpose
+        "latest snapshot per Case" primitive a future Dashboard can also
+        call directly (e.g. "latest analysis for these specific case_ids",
+        no time-window concept involved at all). A caller that also wants
+        to scope by Case creation time composes this with
+        list_case_ids_created_in_window (its Case-identity/creation-time
+        counterpart) rather than this method absorbing that filter itself.
+
+        Ordering is deterministic: case_id ascending.
+        """
+        if case_ids is not None and not case_ids:
+            return []
+
+        query = """
+            SELECT case_analysis.*
+            FROM case_analysis
+            INNER JOIN (
+                SELECT case_id, MAX(analyzed_at) AS latest_analyzed_at
+                FROM case_analysis
+                {where}
+                GROUP BY case_id
+            ) latest
+              ON case_analysis.case_id = latest.case_id
+             AND case_analysis.analyzed_at = latest.latest_analyzed_at
+            ORDER BY case_analysis.case_id ASC
+        """
+        params: list[Any] = []
+        if case_ids is None:
+            query = query.format(where="")
+        else:
+            ids = list(case_ids)
+            placeholders = ",".join("?" for _ in ids)
+            query = query.format(where=f"WHERE case_id IN ({placeholders})")
+            params.extend(ids)
 
         with self._connect() as db:
             return db.execute(query, params).fetchall()
