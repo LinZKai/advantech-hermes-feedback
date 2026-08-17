@@ -39,6 +39,7 @@ from tools.case_reflection_input import (  # noqa: E402
     CaseIntelligenceRecord,
     ReflectorInput,
     build_reflector_input,
+    is_reflection_eligible,
 )
 from tools.feedback_store_v2 import FeedbackStoreV2  # noqa: E402
 
@@ -262,7 +263,8 @@ class BuildReflectorInputTests(_StoreTestCase):
 
     def test_no_historical_snapshot_double_count(self):
         # A Case re-analyzed three times must still contribute exactly one
-        # count to total_cases and to every by_* bucket -- never three.
+        # count to analyzed_case_count and to every by_* bucket -- never
+        # three.
         self._seed_case("case-1", created_at="2026-01-01T00:00:00+00:00")
         for i in range(3):
             self._create_analysis(
@@ -270,18 +272,74 @@ class BuildReflectorInputTests(_StoreTestCase):
             )
 
         result = build_reflector_input(self.store)
-        self.assertEqual(result.total_cases, 1)
+        self.assertEqual(result.window_case_count, 1)
+        self.assertEqual(result.analyzed_case_count, 1)
         self.assertEqual(dict(result.by_diagnosis), {"knowledge_gap": 1})
 
-    def test_total_cases(self):
+    def test_all_cases_analyzed_window_equals_analyzed(self):
         for i in range(3):
             case_id = f"case-{i}"
             self._seed_case(case_id, created_at="2026-01-01T00:00:00+00:00")
             self._create_analysis(case_id, analyzed_at="2026-01-02T00:00:00+00:00")
 
         result = build_reflector_input(self.store)
-        self.assertEqual(result.total_cases, 3)
+        self.assertEqual(result.window_case_count, 3)
+        self.assertEqual(result.analyzed_case_count, 3)
         self.assertEqual(len(result.cases), 3)
+        self.assertEqual(result.coverage_ratio, 1.0)
+
+    def test_missing_analysis_window_greater_than_analyzed(self):
+        self._seed_case("case-analyzed", created_at="2026-01-01T00:00:00+00:00")
+        self._seed_case("case-unanalyzed", created_at="2026-01-01T00:00:00+00:00")
+        self._create_analysis("case-analyzed", analyzed_at="2026-01-02T00:00:00+00:00")
+
+        result = build_reflector_input(self.store)
+        self.assertGreater(result.window_case_count, result.analyzed_case_count)
+        self.assertEqual(result.window_case_count, 2)
+        self.assertEqual(result.analyzed_case_count, 1)
+
+    def test_unparseable_counted_in_window_not_in_analyzed(self):
+        self._seed_case("case-1", created_at="2026-01-01T00:00:00+00:00")
+        self._create_analysis(
+            "case-1", analyzed_at="2026-01-02T00:00:00+00:00", evidence_json="not valid json",
+        )
+        result = build_reflector_input(self.store)
+        self.assertEqual(result.window_case_count, 1)
+        self.assertEqual(result.analyzed_case_count, 0)
+        self.assertEqual(result.cases_with_unparseable_analysis, ("case-1",))
+
+    def test_window_equals_analyzed_plus_missing_plus_unparseable(self):
+        self._seed_case("case-analyzed", created_at="2026-01-01T00:00:00+00:00")
+        self._seed_case("case-missing", created_at="2026-01-01T00:00:00+00:00")
+        self._seed_case("case-unparseable", created_at="2026-01-01T00:00:00+00:00")
+        self._create_analysis("case-analyzed", analyzed_at="2026-01-02T00:00:00+00:00")
+        self._create_analysis(
+            "case-unparseable", analyzed_at="2026-01-02T00:00:00+00:00", evidence_json="{bad",
+        )
+
+        result = build_reflector_input(self.store)
+        self.assertEqual(
+            result.window_case_count,
+            result.analyzed_case_count
+            + len(result.cases_missing_analysis)
+            + len(result.cases_with_unparseable_analysis),
+        )
+        self.assertEqual(result.window_case_count, 3)
+        self.assertEqual(result.analyzed_case_count, 1)
+        self.assertEqual(len(result.cases_missing_analysis), 1)
+        self.assertEqual(len(result.cases_with_unparseable_analysis), 1)
+
+    def test_coverage_ratio_partial(self):
+        for i in range(10):
+            case_id = f"case-{i}"
+            self._seed_case(case_id, created_at="2026-01-01T00:00:00+00:00")
+            if i < 8:
+                self._create_analysis(case_id, analyzed_at="2026-01-02T00:00:00+00:00")
+
+        result = build_reflector_input(self.store)
+        self.assertEqual(result.window_case_count, 10)
+        self.assertEqual(result.analyzed_case_count, 8)
+        self.assertEqual(result.coverage_ratio, 0.8)
 
     def test_by_product_model(self):
         self._seed_case("case-a", created_at="2026-01-01T00:00:00+00:00")
@@ -358,7 +416,7 @@ class BuildReflectorInputTests(_StoreTestCase):
         # Never silently dropped, and never merged into `cases`.
         self.assertEqual(result.cases, ())
         self.assertEqual(result.cases_with_unparseable_analysis, ("case-1",))
-        self.assertEqual(result.total_cases, 0)
+        self.assertEqual(result.analyzed_case_count, 0)
 
     def test_missing_latest_analysis_behavior(self):
         self._seed_case("case-analyzed", created_at="2026-01-01T00:00:00+00:00")
@@ -369,7 +427,7 @@ class BuildReflectorInputTests(_StoreTestCase):
         self.assertEqual([c.case_id for c in result.cases], ["case-analyzed"])
         self.assertEqual(result.cases_missing_analysis, ("case-unanalyzed",))
         # Never silently counted as analyzed.
-        self.assertEqual(result.total_cases, 1)
+        self.assertEqual(result.analyzed_case_count, 1)
 
     def test_empty_window_returns_empty_reflector_input(self):
         result = build_reflector_input(
@@ -377,7 +435,9 @@ class BuildReflectorInputTests(_StoreTestCase):
         )
         self.assertEqual(result.cases, ())
         self.assertEqual(result.cases_missing_analysis, ())
-        self.assertEqual(result.total_cases, 0)
+        self.assertEqual(result.window_case_count, 0)
+        self.assertEqual(result.analyzed_case_count, 0)
+        self.assertEqual(result.coverage_ratio, 0.0)
         self.assertEqual(dict(result.by_product_model), {})
 
 
@@ -423,42 +483,167 @@ class ReflectorInputContractTests(unittest.TestCase):
         record = self._record(evidence=())
         self.assertEqual(record.evidence, ())
 
-    def test_reflector_input_total_cases_mismatch_rejected(self):
-        record = self._record()
-        with self.assertRaises(ValueError):
-            ReflectorInput(
-                window_start=None, window_end=None,
-                cases=(record,),
-                cases_missing_analysis=(),
-                cases_with_unparseable_analysis=(),
-                total_cases=2,  # wrong -- len(cases) is 1
-                by_product_model={UNKNOWN_PRODUCT_MODEL_BUCKET: 1},
-                by_issue_type={"product_usage_or_application": 1},
-                by_diagnosis={"knowledge_gap": 1},
-            )
 
-    def test_reflector_input_aggregation_sum_mismatch_rejected(self):
-        record = self._record()
-        with self.assertRaises(ValueError):
-            ReflectorInput(
-                window_start=None, window_end=None,
-                cases=(record,),
-                cases_missing_analysis=(),
-                cases_with_unparseable_analysis=(),
-                total_cases=1,
-                by_product_model={UNKNOWN_PRODUCT_MODEL_BUCKET: 2},  # wrong -- must sum to 1
-                by_issue_type={"product_usage_or_application": 1},
-                by_diagnosis={"knowledge_gap": 1},
-            )
+class ReflectorInputInvariantTests(unittest.TestCase):
+    """Direct ReflectorInput construction/validation -- the
+    window_case_count / analyzed_case_count / coverage_ratio invariants
+    added in Slice 1.1, plus the pre-existing aggregation-sum invariant."""
 
-    def test_reflector_input_frozen(self):
-        result = ReflectorInput(
-            window_start=None, window_end=None,
-            cases=(), cases_missing_analysis=(), cases_with_unparseable_analysis=(),
-            total_cases=0, by_product_model={}, by_issue_type={}, by_diagnosis={},
+    def _record(self, **overrides):
+        defaults = dict(
+            case_id="case-1", case_title="t", issue_summary="s",
+            product_model=None, product_source=None, product_confidence=None,
+            issue_type="product_usage_or_application", issue_type_confidence=0.5,
+            diagnosis="knowledge_gap", diagnosis_confidence=0.5,
+            evidence=(), analysis_version="v1",
+            analyzed_at="2026-01-01T00:00:00+00:00",
+            source_evidence_watermark="2026-01-01T00:00:00+00:00",
         )
+        defaults.update(overrides)
+        return CaseIntelligenceRecord(**defaults)
+
+    def _reflector_input(self, **overrides):
+        record = self._record()
+        defaults = dict(
+            window_start=None, window_end=None,
+            cases=(record,),
+            cases_missing_analysis=(),
+            cases_with_unparseable_analysis=(),
+            window_case_count=1,
+            analyzed_case_count=1,
+            coverage_ratio=1.0,
+            by_product_model={UNKNOWN_PRODUCT_MODEL_BUCKET: 1},
+            by_issue_type={"product_usage_or_application": 1},
+            by_diagnosis={"knowledge_gap": 1},
+        )
+        defaults.update(overrides)
+        return ReflectorInput(**defaults)
+
+    def test_analyzed_case_count_mismatch_with_cases_rejected(self):
+        with self.assertRaises(ValueError):
+            self._reflector_input(analyzed_case_count=2)  # wrong -- len(cases) is 1
+
+    def test_window_case_count_mismatch_rejected(self):
+        # window_case_count must equal analyzed + missing + unparseable.
+        with self.assertRaises(ValueError):
+            self._reflector_input(window_case_count=5)
+
+    def test_coverage_ratio_mismatch_rejected(self):
+        with self.assertRaises(ValueError):
+            self._reflector_input(coverage_ratio=0.5)  # should be 1.0 for 1/1
+
+    def test_coverage_ratio_out_of_range_rejected(self):
+        with self.assertRaises(ValueError):
+            self._reflector_input(
+                cases=(), cases_missing_analysis=(), cases_with_unparseable_analysis=(),
+                window_case_count=0, analyzed_case_count=0, coverage_ratio=1.5,
+                by_product_model={}, by_issue_type={}, by_diagnosis={},
+            )
+
+    def test_aggregation_sum_mismatch_rejected(self):
+        with self.assertRaises(ValueError):
+            self._reflector_input(
+                by_product_model={UNKNOWN_PRODUCT_MODEL_BUCKET: 2},  # wrong -- must sum to 1
+            )
+
+    def test_valid_construction_with_gaps(self):
+        # window_case_count = analyzed(1) + missing(1) + unparseable(1) = 3.
+        result = self._reflector_input(
+            cases_missing_analysis=("case-missing",),
+            cases_with_unparseable_analysis=("case-bad",),
+            window_case_count=3,
+            analyzed_case_count=1,
+            coverage_ratio=1 / 3,
+        )
+        self.assertEqual(result.window_case_count, 3)
+
+    def test_frozen(self):
+        result = self._reflector_input()
         with self.assertRaises(Exception):
-            result.total_cases = 5  # type: ignore[misc]
+            result.analyzed_case_count = 5  # type: ignore[misc]
+
+
+class MappingImmutabilityTests(_StoreTestCase):
+    """The by_* aggregation fields are types.MappingProxyType -- a
+    genuinely immutable view, not just a type hint. See this module's
+    docstring for why this is a serialization boundary (json.dumps()
+    cannot consume a mappingproxy directly) rather than a JSON-ready
+    shape -- no serializer is built in this slice."""
+
+    def _result(self) -> ReflectorInput:
+        self._seed_case("case-1", created_at="2026-01-01T00:00:00+00:00")
+        self._create_analysis(
+            "case-1", analyzed_at="2026-01-02T00:00:00+00:00",
+            issue_type="product_issue", diagnosis="knowledge_gap",
+        )
+        return build_reflector_input(self.store)
+
+    def test_by_product_model_rejects_item_assignment(self):
+        result = self._result()
+        with self.assertRaises(TypeError):
+            result.by_product_model["ADAM-6266"] = 99  # type: ignore[index]
+
+    def test_by_issue_type_rejects_item_assignment(self):
+        result = self._result()
+        with self.assertRaises(TypeError):
+            result.by_issue_type["product_issue"] = 99  # type: ignore[index]
+
+    def test_by_diagnosis_rejects_item_assignment(self):
+        result = self._result()
+        with self.assertRaises(TypeError):
+            result.by_diagnosis["knowledge_gap"] = 99  # type: ignore[index]
+
+
+class ReflectionEligibilityTests(_StoreTestCase):
+    def _input_with_analyzed(
+        self, count: int, *, window_count: int | None = None, prefix: str = "case",
+    ) -> ReflectorInput:
+        window_count = count if window_count is None else window_count
+        for i in range(window_count):
+            case_id = f"{prefix}-{i}"
+            self._seed_case(case_id, created_at="2026-01-01T00:00:00+00:00")
+            if i < count:
+                self._create_analysis(case_id, analyzed_at="2026-01-02T00:00:00+00:00")
+        return build_reflector_input(self.store)
+
+    def test_exactly_at_threshold_is_eligible(self):
+        reflector_input = self._input_with_analyzed(5)
+        self.assertTrue(is_reflection_eligible(reflector_input, min_analyzed_cases=5))
+
+    def test_below_threshold_is_not_eligible(self):
+        reflector_input = self._input_with_analyzed(4)
+        self.assertFalse(is_reflection_eligible(reflector_input, min_analyzed_cases=5))
+
+    def test_above_threshold_is_eligible(self):
+        reflector_input = self._input_with_analyzed(9)
+        self.assertTrue(is_reflection_eligible(reflector_input, min_analyzed_cases=5))
+
+    def test_invalid_threshold_zero_rejected(self):
+        reflector_input = self._input_with_analyzed(5)
+        with self.assertRaises(ValueError):
+            is_reflection_eligible(reflector_input, min_analyzed_cases=0)
+
+    def test_invalid_threshold_negative_rejected(self):
+        reflector_input = self._input_with_analyzed(5)
+        with self.assertRaises(ValueError):
+            is_reflection_eligible(reflector_input, min_analyzed_cases=-1)
+
+    def test_eligibility_ignores_window_case_count(self):
+        # window=10, analyzed=5, threshold=5 -> True: eligibility is judged
+        # purely on analyzed_case_count, never on the larger window count
+        # that also includes Cases the Reflector has no evidence for.
+        reflector_input = self._input_with_analyzed(5, window_count=10)
+        self.assertEqual(reflector_input.window_case_count, 10)
+        self.assertEqual(reflector_input.analyzed_case_count, 5)
+        self.assertTrue(is_reflection_eligible(reflector_input, min_analyzed_cases=5))
+
+    def test_default_threshold_accepts_five(self):
+        reflector_input = self._input_with_analyzed(5)
+        self.assertTrue(is_reflection_eligible(reflector_input))
+
+    def test_default_threshold_rejects_four(self):
+        reflector_input = self._input_with_analyzed(4)
+        self.assertFalse(is_reflection_eligible(reflector_input))
 
 
 if __name__ == "__main__":

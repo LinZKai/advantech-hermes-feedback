@@ -38,6 +38,21 @@ responsibility stays Case Enrichment staleness, not Case occurrence time).
 Cross-Case pattern detection itself (similarity, recurrence, proposals) is
 explicitly NOT this module's job -- this module only assembles the
 deterministic facts a future Reflector LLM step will reason over.
+
+Serialization boundary (Slice 1.1): ReflectorInput.by_product_model/
+by_issue_type/by_diagnosis are types.MappingProxyType, an intentionally
+immutable view -- NOT a JSON-ready shape. Standard library json.dumps()
+raises TypeError on a mappingproxy directly (it is not a dict subclass);
+a future serializer (a later slice, not built here) must convert each via
+dict(...) before calling json.dumps(). This module deliberately builds no
+such serializer -- see build_reflector_input's docstring.
+
+Eligibility (Slice 1.1): is_reflection_eligible() below is a deliberately
+separate, tiny, LLM-free function -- ReflectorInput is a pure evidence/data
+contract with no opinion on whether a Reflector run should actually
+proceed; "should we run Reflector now" is an orchestration POLICY decision
+(a future batch runner's job, not built here), so the threshold is a
+caller-supplied parameter, never a ReflectorInput field.
 """
 from __future__ import annotations
 
@@ -288,23 +303,58 @@ class ReflectorInput:
 
     Two gap-tracking fields make missing/broken data structurally
     impossible to miss (never silently dropped -- see
-    build_reflector_input's docstring for the full reasoning):
+    build_reflector_input's docstring for the full reasoning). Neither is
+    a permanent verdict on the Case -- a later batch's Case Enrichment
+    retry can still resolve either gap; this module has no retry logic of
+    its own and does not track any such history:
       * `cases_missing_analysis` -- case_id of every window Case with NO
         case_analysis row at all yet.
       * `cases_with_unparseable_analysis` -- case_id of every window Case
         whose latest case_analysis row exists but failed to reconstruct
         into a valid CaseIntelligenceRecord.
-    Neither bucket is included in `cases`, `total_cases`, or any by_*
-    aggregation.
+    Neither bucket is included in `cases`, `analyzed_case_count`, or any
+    by_* aggregation.
 
-    `total_cases`/`by_product_model`/`by_issue_type`/`by_diagnosis` are
-    computed ONLY over `cases` -- pure counting, no interpretation. by_*
-    values are immutable (types.MappingProxyType) and key-sorted for
-    deterministic iteration; by_product_model uses
+    Count semantics (Slice 1.1 clarification -- see this module's
+    docstring for why a single ambiguous `total_cases` was replaced):
+      * `window_case_count` -- how many Cases actually occurred in this
+        window (from list_case_ids_created_in_window()), regardless of
+        analysis status. This is the "how many support issues happened"
+        number.
+      * `analyzed_case_count` -- how many of those Cases are actually
+        USABLE by a Reflector step right now: successfully analyzed AND
+        successfully parsed, i.e. exactly `len(cases)`. This is the "how
+        many Cases does ReflectorInput.cases actually cover" number.
+    These are deliberately two different numbers -- reading
+    `analyzed_case_count` alone as "how many Cases happened this window"
+    would understate the window whenever coverage is incomplete. Exact
+    invariant (checked below, not just documented):
+
+        window_case_count
+        == analyzed_case_count
+         + len(cases_missing_analysis)
+         + len(cases_with_unparseable_analysis)
+
+    `coverage_ratio` is a deterministic, purely observational metric --
+    analyzed_case_count / window_case_count, or 0.0 when
+    window_case_count is 0 (an empty window has nothing to cover, not
+    "100% coverage of nothing"). NOT used as a hard gate anywhere in this
+    module -- see is_reflection_eligible() (a separate, orchestration-
+    policy function) for the actual eligibility decision, which
+    deliberately does NOT read coverage_ratio at all (see that function's
+    docstring for why).
+
+    `by_product_model`/`by_issue_type`/`by_diagnosis` are computed ONLY
+    over `cases` and sum to `analyzed_case_count` -- NEVER
+    `window_case_count` -- pure counting, no interpretation. by_* values
+    are immutable (types.MappingProxyType, see this module's docstring for
+    why that is a serialization boundary, not a JSON-ready shape) and
+    key-sorted for deterministic iteration; by_product_model uses
     UNKNOWN_PRODUCT_MODEL_BUCKET for a Case with product_model=None.
 
     Deliberately carries no LLM behavior, no persistence, no scheduler
-    concept -- exactly the same "contract only, no side effects" shape as
+    concept, and no eligibility-threshold policy (see is_reflection_eligible)
+    -- exactly the same "contract only, no side effects" shape as
     tools.case_enrichment.CaseEnrichmentInput.
     """
 
@@ -313,7 +363,9 @@ class ReflectorInput:
     cases: tuple[CaseIntelligenceRecord, ...]
     cases_missing_analysis: tuple[str, ...]
     cases_with_unparseable_analysis: tuple[str, ...]
-    total_cases: int
+    window_case_count: int
+    analyzed_case_count: int
+    coverage_ratio: float
     by_product_model: Mapping[str, int]
     by_issue_type: Mapping[str, int]
     by_diagnosis: Mapping[str, int]
@@ -337,10 +389,38 @@ class ReflectorInput:
         ):
             raise ValueError("cases_with_unparseable_analysis must be a tuple of str")
 
-        if self.total_cases != len(self.cases):
+        if self.analyzed_case_count != len(self.cases):
             raise ValueError(
-                f"total_cases ({self.total_cases}) must equal len(cases) ({len(self.cases)})"
+                f"analyzed_case_count ({self.analyzed_case_count}) must equal "
+                f"len(cases) ({len(self.cases)})"
             )
+
+        expected_window_case_count = (
+            self.analyzed_case_count
+            + len(self.cases_missing_analysis)
+            + len(self.cases_with_unparseable_analysis)
+        )
+        if self.window_case_count != expected_window_case_count:
+            raise ValueError(
+                f"window_case_count ({self.window_case_count}) must equal "
+                f"analyzed_case_count + len(cases_missing_analysis) + "
+                f"len(cases_with_unparseable_analysis) ({expected_window_case_count})"
+            )
+
+        expected_coverage_ratio = (
+            self.analyzed_case_count / self.window_case_count if self.window_case_count > 0 else 0.0
+        )
+        if (
+            isinstance(self.coverage_ratio, bool)
+            or not isinstance(self.coverage_ratio, (int, float))
+            or self.coverage_ratio != expected_coverage_ratio
+        ):
+            raise ValueError(
+                f"coverage_ratio ({self.coverage_ratio!r}) must equal "
+                f"analyzed_case_count / window_case_count ({expected_coverage_ratio!r})"
+            )
+        if not (0.0 <= self.coverage_ratio <= 1.0):
+            raise ValueError(f"coverage_ratio out of range [0.0, 1.0]: {self.coverage_ratio!r}")
 
         for name, mapping in (
             ("by_product_model", self.by_product_model),
@@ -350,9 +430,10 @@ class ReflectorInput:
             if not isinstance(mapping, Mapping):
                 raise ValueError(f"{name} must be a Mapping")
             total = sum(mapping.values())
-            if total != self.total_cases:
+            if total != self.analyzed_case_count:
                 raise ValueError(
-                    f"{name} counts ({total}) must sum to total_cases ({self.total_cases})"
+                    f"{name} counts ({total}) must sum to analyzed_case_count "
+                    f"({self.analyzed_case_count})"
                 )
 
 
@@ -387,8 +468,8 @@ def build_reflector_input(
         gap (missing analysis / unparseable analysis)
                 |
                 v
-        deterministic aggregation (total_cases / by_product_model /
-        by_issue_type / by_diagnosis)
+        deterministic aggregation (window_case_count / analyzed_case_count /
+        coverage_ratio / by_product_model / by_issue_type / by_diagnosis)
                 |
                 v
         ReflectorInput
@@ -406,9 +487,12 @@ def build_reflector_input(
     valid CaseIntelligenceRecord (malformed evidence_json, or a value that
     no longer matches the current taxonomy) is recorded in
     ReflectorInput.cases_with_unparseable_analysis, never merged into
-    `cases` and never dropped without a trace. `total_cases` and every
-    by_* aggregation are computed ONLY over `cases` (the successfully
-    reconstructed records).
+    `cases` and never dropped without a trace. `analyzed_case_count` and
+    every by_* aggregation are computed ONLY over `cases` (the
+    successfully reconstructed records) -- `window_case_count` is the
+    separate, larger number that also counts the two gap buckets (see
+    ReflectorInput's own docstring for the exact invariant and why the two
+    counts must not be conflated).
 
     This function deliberately does NOT hard-fail the whole build when
     some window Cases lack analysis. The normal Phase 5 batch cycle already
@@ -458,22 +542,87 @@ def build_reflector_input(
     by_issue_type = _count_by(records, lambda r: r.issue_type)
     by_diagnosis = _count_by(records, lambda r: r.diagnosis)
 
+    window_case_count = len(case_ids)
+    analyzed_case_count = len(records)
+    coverage_ratio = analyzed_case_count / window_case_count if window_case_count > 0 else 0.0
+
     return ReflectorInput(
         window_start=window_start,
         window_end=window_end,
         cases=tuple(records),
         cases_missing_analysis=tuple(missing),
         cases_with_unparseable_analysis=tuple(unparseable),
-        total_cases=len(records),
+        window_case_count=window_case_count,
+        analyzed_case_count=analyzed_case_count,
+        coverage_ratio=coverage_ratio,
         by_product_model=by_product_model,
         by_issue_type=by_issue_type,
         by_diagnosis=by_diagnosis,
     )
 
 
+# ---------------------------------------------------------------------------
+# Reflection eligibility -- orchestration POLICY, deliberately separate from
+# the ReflectorInput data contract above (see this module's docstring)
+# ---------------------------------------------------------------------------
+
+# First-cut POC default (Phase 5 task instruction) -- a plain, unenforced
+# default a caller may override, never a value baked into ReflectorInput
+# itself. Matches the tools.case_routing.DEFAULT_CONFIDENCE_THRESHOLD
+# convention: a named module-level constant used as a function's default
+# keyword argument, not a hidden magic number.
+DEFAULT_MIN_ANALYZED_CASES_FOR_REFLECTION = 5
+
+
+def is_reflection_eligible(
+    reflector_input: ReflectorInput,
+    *,
+    min_analyzed_cases: int = DEFAULT_MIN_ANALYZED_CASES_FOR_REFLECTION,
+) -> bool:
+    """Whether this ReflectorInput has enough usable Case Intelligence for
+    a Reflector run to proceed -- deterministic, no LLM call.
+
+    Reads ONLY analyzed_case_count -- never window_case_count and never
+    coverage_ratio. window_case_count also counts Cases this ReflectorInput
+    cannot actually give the Reflector any evidence for (missing/
+    unparseable), so gating on it would let a window with many occurrences
+    but few usable analyses pass eligibility on the strength of Cases the
+    Reflector will never actually see. coverage_ratio is deliberately kept
+    observational-only in this slice (see ReflectorInput's docstring) --
+    not read here either, so a small-but-fully-covered window (e.g. 5
+    analyzed out of 5 occurred) and a large-but-partially-covered window
+    (e.g. 5 analyzed out of 50 occurred) are judged identically by this
+    function, exactly matching the "analyzed_case_count >= min_analyzed_cases"
+    semantics the task specifies -- coverage-aware gating is an explicit
+    non-goal of this slice.
+
+    `min_analyzed_cases` is a caller-supplied ORCHESTRATION POLICY
+    parameter, never a ReflectorInput field -- a future batch runner (not
+    built in this slice) decides the real threshold; this function only
+    evaluates one already-decided threshold against one already-built
+    ReflectorInput. Fails closed on an invalid threshold: raises
+    ValueError immediately for a non-int or non-positive
+    min_analyzed_cases, matching tools.case_routing.validate_case_routing's
+    own convention for confidence_threshold ("a non-numeric or
+    out-of-range ... is a caller programming error, not a data-quality
+    problem ... raises ValueError immediately") -- an invalid threshold is
+    the caller's bug, not something to fold into a False return.
+    """
+    if (
+        isinstance(min_analyzed_cases, bool)
+        or not isinstance(min_analyzed_cases, int)
+        or min_analyzed_cases < 1
+    ):
+        raise ValueError(f"invalid min_analyzed_cases: {min_analyzed_cases!r}")
+
+    return reflector_input.analyzed_case_count >= min_analyzed_cases
+
+
 __all__ = [
+    "DEFAULT_MIN_ANALYZED_CASES_FOR_REFLECTION",
     "UNKNOWN_PRODUCT_MODEL_BUCKET",
     "CaseIntelligenceRecord",
     "ReflectorInput",
     "build_reflector_input",
+    "is_reflection_eligible",
 ]
