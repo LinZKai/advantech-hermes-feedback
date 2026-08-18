@@ -663,6 +663,9 @@ COPY custom/universal-feedback/overlay/tools/reflector_analyzer.py \
 COPY custom/universal-feedback/overlay/tools/reflector_persistence.py \
     /opt/hermes/tools/reflector_persistence.py
 
+COPY custom/universal-feedback/overlay/tools/run_reflector.py \
+    /opt/hermes/tools/run_reflector.py
+
 RUN mkdir -p /opt/hermes/migrations
 
 COPY custom/universal-feedback/overlay/migrations/001_universal_feedback.sql \
@@ -705,6 +708,7 @@ RUN set -eu; \
         /opt/hermes/tools/reflector_prompt_context.py \
         /opt/hermes/tools/reflector_analyzer.py \
         /opt/hermes/tools/reflector_persistence.py \
+        /opt/hermes/tools/run_reflector.py \
         /opt/hermes/migrations/001_universal_feedback.sql \
         /opt/hermes/migrations/002_feedback_schema_v2.sql \
         /opt/hermes/migrations/003_retrieval_execution_statuses.sql \
@@ -731,9 +735,10 @@ RUN set -eu; \
         /opt/hermes/tools/proposal_matching.py \
         /opt/hermes/tools/reflector_prompt_context.py \
         /opt/hermes/tools/reflector_analyzer.py \
-        /opt/hermes/tools/reflector_persistence.py; \
+        /opt/hermes/tools/reflector_persistence.py \
+        /opt/hermes/tools/run_reflector.py; \
     /opt/hermes/.venv/bin/python -c \
-        'import tools.feedback_store_v2, tools.retrieval_observer, tools.retrieval_runtime, tools.case_routing, tools.feedback_mirror, tools.case_enrichment, tools.case_enrichment_analyzer, tools.run_case_enrichment, tools.case_reflection_input, tools.reflector_proposals, tools.proposal_matching, tools.reflector_prompt_context, tools.reflector_analyzer, tools.reflector_persistence'
+        'import tools.feedback_store_v2, tools.retrieval_observer, tools.retrieval_runtime, tools.case_routing, tools.feedback_mirror, tools.case_enrichment, tools.case_enrichment_analyzer, tools.run_case_enrichment, tools.case_reflection_input, tools.reflector_proposals, tools.proposal_matching, tools.reflector_prompt_context, tools.reflector_analyzer, tools.reflector_persistence, tools.run_reflector'
 
 # END ADVANTECH UNIVERSAL FEEDBACK
 
