@@ -114,7 +114,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Collection
+from typing import Any, Collection, Mapping
 
 from tools.feedback_callbacks import REASON_CODES, is_valid_reason_code
 from tools.feedback_storage import DEFAULT_PATH, MAX_SUGGESTION_TEXT_LENGTH
@@ -2112,6 +2112,172 @@ class FeedbackStoreV2:
 
         with self._connect() as db:
             return db.execute(query, params).fetchall()
+
+    def persist_reflection_proposals(
+        self,
+        reflection_run_id: str,
+        *,
+        new_proposals: Collection[Mapping[str, Any]],
+        observations: Collection[Mapping[str, Any]],
+    ) -> bool:
+        """Atomically insert every new Proposal and every Observation for
+        one Reflection Run, in a SINGLE transaction -- either every row is
+        written, or none is (Phase 5 Slice 6A task instruction, section 4:
+        never a Proposal with no Observation, never a half-written
+        Observation batch).
+
+        Unlike create_improvement_proposal()/create_proposal_observation()
+        (each its own implicit commit-per-call transaction via
+        self._connect()'s `with` context), this method opens one explicit
+        BEGIN IMMEDIATE / COMMIT / ROLLBACK transaction on a dedicated
+        connection, mirroring the exact choreography this module already
+        uses for _upgrade_retrieval_runs_execution_statuses() / _upgrade_
+        case_analysis_taxonomy() (see those methods' own docstrings) --
+        the only other place in this module more than one write needs to
+        succeed or fail together. `PRAGMA foreign_keys=ON` is set
+        explicitly on this fresh connection (SQLite defaults a brand-new
+        connection to foreign_keys=OFF) so the FK-violation-based fail-
+        closed behavior below actually fires.
+
+        `new_proposals` items need: proposal_id, improvement_target,
+        title, created_at (review_status is never caller-supplied here
+        either -- forced to 'pending', matching create_improvement_
+        proposal()'s own "only one legal initial value" convention).
+        `observations` items need: observation_id, proposal_id, trend,
+        pattern_summary, possible_cause, recommended_improvement,
+        expected_benefit, limitations, supporting_case_ids_json,
+        supporting_case_count, confidence, observed_at -- the exact same
+        shape create_proposal_observation() already takes, minus
+        reflection_run_id (this method's own `reflection_run_id`
+        parameter is used for every row, never read from the mapping, so
+        a caller cannot accidentally attach one Observation to a
+        different Run than the rest of this same call's batch).
+
+        Plain Mapping[str, Any] rows, not tools.reflector_proposals.
+        ImprovementProposal/ProposalObservation instances -- this module
+        must not import that module (it would be a circular import: that
+        module already imports taxonomy constants FROM this one). A
+        caller with ImprovementProposal/ProposalObservation objects (e.g.
+        a future persist_reflection_result() glue function) is expected
+        to project each into this plain-mapping shape itself, exactly how
+        tools.run_case_enrichment already projects a CaseEnrichmentResult
+        into create_case_analysis()'s own plain keyword arguments.
+
+        Re-validates every primitive value in Python before opening the
+        transaction (fail closed, before touching the DB at all) --
+        mirrors create_improvement_proposal()/create_proposal_observation()'s
+        own "never depends on the caller's dataclass __post_init__ having
+        already run" convention, since this is a public storage boundary
+        too. Cross-field rules (trend requires supporting cases except
+        'no_longer_observed', etc.) are NOT re-checked here, matching
+        create_proposal_observation()'s own reasoning: single-column
+        checks are this layer's job, cross-field consistency is the
+        dataclass layer's.
+
+        Insertion order within the transaction is always every
+        new_proposals row, THEN every observations row -- an Observation
+        founding a brand-new Proposal (action=create_new) would otherwise
+        violate proposal_observations' own
+        FOREIGN KEY (proposal_id) REFERENCES improvement_proposals
+        (proposal_id) constraint, since that Proposal row would not exist
+        yet.
+
+        The match_existing / create_new guardrails Phase 5 Slice 6A task
+        instruction sections 6-7 ask for are NOT re-implemented as
+        separate Python checks here -- they fall directly out of the
+        schema's own constraints, which this method never bypasses:
+          * an Observation whose proposal_id names neither a Proposal in
+            `new_proposals` (this call) nor an already-existing
+            improvement_proposals row violates the FOREIGN KEY constraint
+            above -- exactly "match_existing referencing a Proposal that
+            does not exist" (Phase 5 Slice 6A task instruction, section 6:
+            "如果不存在：fail closed").
+          * a duplicate proposal_id in `new_proposals` (or one that
+            collides with an existing row) violates improvement_proposals'
+            own PRIMARY KEY -- exactly "duplicate create_new Proposal ID"
+            (section 7: "如果 duplicate proposal_id：fail closed / rollback").
+        Both surface as sqlite3.IntegrityError, caught below, which rolls
+        back the WHOLE transaction and returns False -- never a partial
+        write, never a silently-ignored duplicate.
+
+        Returns False, never raises, for: an invalid improvement_target/
+        blank title on any new_proposals row; an invalid trend/blank
+        pattern_summary/blank recommended_improvement/invalid confidence/
+        invalid supporting_case_count on any observations row; or any
+        sqlite3.IntegrityError raised while executing the transaction
+        (already-rolled-back by this method itself in every such case --
+        the caller never needs to issue its own ROLLBACK).
+        """
+        for proposal in new_proposals:
+            if proposal["improvement_target"] not in _IMPROVEMENT_TARGET_VALUE_SET:
+                return False
+            if not isinstance(proposal["title"], str) or not proposal["title"].strip():
+                return False
+
+        for observation in observations:
+            if observation["trend"] not in _PROPOSAL_TREND_VALUE_SET:
+                return False
+            if not isinstance(observation["pattern_summary"], str) or not observation["pattern_summary"].strip():
+                return False
+            if (
+                not isinstance(observation["recommended_improvement"], str)
+                or not observation["recommended_improvement"].strip()
+            ):
+                return False
+            if not _is_valid_confidence(observation["confidence"]):
+                return False
+            count = observation["supporting_case_count"]
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                return False
+
+        db = sqlite3.connect(self.path)
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                for proposal in new_proposals:
+                    db.execute(
+                        """
+                        INSERT INTO improvement_proposals (
+                            proposal_id, improvement_target, title, review_status, created_at
+                        ) VALUES (?, ?, ?, 'pending', ?)
+                        """,
+                        (
+                            str(proposal["proposal_id"]), proposal["improvement_target"],
+                            proposal["title"], str(proposal["created_at"]),
+                        ),
+                    )
+                for observation in observations:
+                    db.execute(
+                        """
+                        INSERT INTO proposal_observations (
+                            observation_id, proposal_id, reflection_run_id,
+                            trend, pattern_summary, possible_cause,
+                            recommended_improvement, expected_benefit, limitations,
+                            supporting_case_ids_json, supporting_case_count,
+                            confidence, observed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(observation["observation_id"]), str(observation["proposal_id"]),
+                            str(reflection_run_id),
+                            observation["trend"], observation["pattern_summary"], observation["possible_cause"],
+                            observation["recommended_improvement"], observation["expected_benefit"],
+                            observation["limitations"],
+                            str(observation["supporting_case_ids_json"]), int(observation["supporting_case_count"]),
+                            observation["confidence"], str(observation["observed_at"]),
+                        ),
+                    )
+            except sqlite3.IntegrityError:
+                db.execute("ROLLBACK")
+                return False
+            else:
+                db.execute("COMMIT")
+            return True
+        finally:
+            db.close()
 
 
 __all__ = [

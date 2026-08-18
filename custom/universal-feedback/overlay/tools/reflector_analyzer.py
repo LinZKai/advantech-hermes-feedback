@@ -196,6 +196,17 @@ from tools.reflector_proposals import (
     build_supporting_case_ids,
 )
 
+# Prompt + reasoning-policy generation version -- bump only on a breaking
+# change to _SYSTEM_INSTRUCTIONS' semantics or the ReflectionResult/
+# ProposalResolution contract, never for routine prompt wording tweaks.
+# Mirrors tools.case_enrichment_analyzer.ANALYSIS_VERSION's exact naming
+# and versioning convention (a plain, non-timestamp string -- see that
+# constant's own docstring for why); a future Slice 6B runner is expected
+# to pass this as create_reflection_run()'s reflector_version argument,
+# the same way tools.run_case_enrichment already passes ANALYSIS_VERSION
+# to create_case_analysis()'s analysis_version argument.
+REFLECTOR_VERSION = "reflector-v1"
+
 # ---------------------------------------------------------------------------
 # Reasoning policy -- stable, model-facing instructions. Not runtime
 # implementation, not a DB/storage instruction of any kind (mirrors tools.
@@ -276,6 +287,10 @@ You are not required to produce a finding for every run. If nothing in the given
 ## Human review boundary
 
 An Improvement Proposal you produce is a recommendation for a human reviewer -- it is never permission to modify the knowledge base, SOUL, a Skill, or any production system directly, regardless of improvement_target.
+
+## Language
+
+Write run_summary, title, pattern_summary, possible_cause, recommended_improvement, expected_benefit, and limitations in Traditional Chinese (zh-TW). Preserve product names, technical terms, code, commands, and identifiers -- and standard English terminology where translating it would reduce precision -- in their original form within that Chinese text. JSON keys, enum values (action, improvement_target, trend), proposal_id, and case_id values must remain exactly as defined by the schema, in English, regardless of this rule.
 
 ## Output format
 
@@ -672,6 +687,7 @@ def analyze_reflection_with_llm(
 
 
 __all__ = [
+    "REFLECTOR_VERSION",
     "parse_reflector_output",
     "ReflectorAnalyzerError",
     "analyze_reflection_with_llm",

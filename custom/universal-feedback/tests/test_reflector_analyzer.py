@@ -462,6 +462,67 @@ class PromptTextSanityTests(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertIn(action, _SYSTEM_INSTRUCTIONS)
 
+    def test_system_instructions_states_the_traditional_chinese_language_policy(self):
+        # Static prompt-text sanity check (this module's own written
+        # policy, not a simulation of what a model would say) -- not the
+        # "assert '中' in fake output" pattern this Slice's task
+        # instruction explicitly warns against, since a fake llm_call has
+        # no reason to actually emit Chinese text (see
+        # LanguagePolicyParsingTests below for what IS tested against
+        # parser behavior instead).
+        self.assertIn("Traditional Chinese", _SYSTEM_INSTRUCTIONS)
+        self.assertIn("zh-TW", _SYSTEM_INSTRUCTIONS)
+
+
+# ---------------------------------------------------------------------------
+# Language policy: the parser must accept Unicode/zh-TW narrative content
+# unchanged, while still validating structural keys/enums strictly in
+# English -- these are parser-behavior tests, not prompt-content tests.
+# ---------------------------------------------------------------------------
+
+
+class LanguagePolicyParsingTests(_ReflectorAnalyzerTestCase):
+    def test_zh_tw_narrative_fields_are_accepted_and_preserved_verbatim(self):
+        finding = _finding_dict(
+            title="ADAM-6266 SNMP 指令回答完整性改善",
+            pattern_summary="多個獨立 Case 顯示 ADAM-6266 的 SNMP disable 指令未被正確回答。",
+            possible_cause="回答生成步驟可能沒有充分使用 retrieval 取得的 command 內容。",
+            recommended_improvement="檢查 answer generation 步驟，確保引用 retrieval 中的具體指令。",
+            expected_benefit="減少同類問題的重複詢問。",
+            limitations="樣本數僅兩筆，可能無法完全代表整體情況。",
+        )
+        result = self._parse(_result_dict(
+            run_summary="本次分析發現一個與 SNMP 相關的 knowledge gap。",
+            findings=[finding],
+        ))
+        self.assertIsInstance(result, ReflectionResult)
+        self.assertEqual(result.run_summary, "本次分析發現一個與 SNMP 相關的 knowledge gap。")
+        proposal = result.new_proposals[0]
+        self.assertEqual(proposal.title, "ADAM-6266 SNMP 指令回答完整性改善")
+        observation = result.proposal_observations[0]
+        self.assertIn("SNMP disable", observation.pattern_summary)
+        self.assertIn("回答生成步驟", observation.possible_cause)
+
+    def test_enum_values_are_still_validated_in_english_even_amid_zh_tw_narrative(self):
+        # A Chinese-language enum value must still fail closed -- the
+        # Language policy governs narrative TEXT fields only, never
+        # structural taxonomy values (Phase 5 Slice 6A task instruction,
+        # section 9: "不要把 machine enum 中文化").
+        finding = _finding_dict(
+            trend="新",  # not a real PROPOSAL_TREND_VALUES member
+            pattern_summary="中文敘述內容。",
+        )
+        self.assertIsNone(self._parse(_result_dict(findings=[finding])))
+
+    def test_json_keys_remain_english_regardless_of_narrative_language(self):
+        # The strict key-set check itself is language-agnostic by
+        # construction (it compares dict *keys*, never touches value
+        # content) -- this test only confirms zh-TW narrative values don't
+        # accidentally relax that check.
+        finding = _finding_dict(pattern_summary="中文敘述內容。")
+        finding["不存在的欄位"] = "extra key, still rejected regardless of language"
+        self.assertIsNone(self._parse(_result_dict(findings=[finding])))
+
 
 # ---------------------------------------------------------------------------
 # Slice 5B fixtures -- fake call_llm, ReflectorPromptContext construction
