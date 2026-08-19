@@ -4433,7 +4433,6 @@ class TelegramAdapter(BasePlatformAdapter):
         store = self._feedback_store
         if not self._bot or store is None:
             return SendResult(success=False, error="Feedback unavailable")
-        assistant_message_id = (metadata or {}).get("assistant_message_id")
         try:
             if not store.create_run(run_id, str(chat_id), **(metadata or {})):
                 return SendResult(success=False, error="Feedback run already exists")
@@ -4458,10 +4457,10 @@ class TelegramAdapter(BasePlatformAdapter):
             feedback_message_id = getattr(msg, "message_id", None)
             if feedback_message_id is None:
                 raise RuntimeError("Telegram feedback send returned no message_id")
-            store.mark_send(run_id, status="sent", assistant_message_id=assistant_message_id, feedback_message_id=str(feedback_message_id), ui_mode="separate_message")
+            store.mark_send(run_id, status="sent", feedback_message_id=str(feedback_message_id))
             return SendResult(success=True, message_id=str(feedback_message_id))
         except Exception as exc:
-            store.mark_send(run_id, status="failed", assistant_message_id=assistant_message_id, feedback_message_id=None, ui_mode="separate_message")
+            store.mark_send(run_id, status="failed", feedback_message_id=None)
             logger.warning("[%s] send_feedback failed: %s", self.name, exc)
             return SendResult(success=False, error=str(exc))
 

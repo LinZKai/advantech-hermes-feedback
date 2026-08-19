@@ -16,11 +16,10 @@
 
 Stage B scope only: assemble the input a future analysis step needs, and
 validate the shape of whatever structured result it produces. No LLM call,
-no persistence (create_case_analysis is never called from here), and no
-Case-identity write (cases.title / cases.product_model are read, never
-written). Storage queries stay in tools.feedback_store_v2 -- this module
-issues no raw SQL of its own, matching tools.retrieval_runtime's own
-"glue, not storage" layering (see that module's docstring).
+no persistence (create_case_analysis is never called from here). Storage
+queries stay in tools.feedback_store_v2 -- this module issues no raw SQL of
+its own, matching tools.retrieval_runtime's own "glue, not storage"
+layering (see that module's docstring).
 
 Case is the analysis boundary throughout: every function here takes a
 single case_id, never a session_id, matching the Phase 4.5 planning
@@ -50,10 +49,11 @@ authoritative value LIST moved.
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from tools._validation import is_valid_confidence as _is_valid_confidence
+from tools._validation import require_nonblank_str as _require_nonblank_str
 from tools.feedback_store_v2 import (
     DIAGNOSIS_VALUES,
     ISSUE_TYPE_VALUES,
@@ -182,32 +182,6 @@ EVIDENCE_TYPES: tuple[str, ...] = ("user_text", "assistant_text", "retrieval", "
 _EVIDENCE_TYPE_SET = frozenset(EVIDENCE_TYPES)
 
 
-def _is_valid_confidence(value: Any) -> bool:
-    """True only for a real, finite JSON number in [0.0, 1.0].
-
-    Deliberately mirrors tools.case_routing._is_valid_confidence's and
-    tools.feedback_store_v2._is_valid_confidence's exact defensive logic
-    (bool-before-int check, NaN/Infinity rejection) rather than importing
-    either of those private, leading-underscore helpers across a module
-    boundary -- neither module exports it, so re-deriving the same small,
-    self-contained numeric check here respects each module's own
-    encapsulation choice instead of reaching past it. This is a validation
-    PATTERN, not a taxonomy-literal duplication -- DIAGNOSIS_VALUES/
-    ISSUE_TYPE_VALUES/PRODUCT_SOURCE_VALUES are all imported from
-    tools.feedback_store_v2 above, never re-declared.
-    """
-    if isinstance(value, bool):
-        return False
-    if not isinstance(value, (int, float)):
-        return False
-    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-        return False
-    return 0.0 <= value <= 1.0
-
-
-def _require_nonblank_str(value: Any, field_name: str) -> None:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field_name} must be a non-blank string, got {value!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -266,14 +240,6 @@ class CaseEnrichmentInput:
     Case boundary, never the whole Session (Phase 4.5 planning audit,
     "Case is the analysis unit").
 
-    `current_title`/`current_product_model` are the Case's EXISTING
-    `cases.title`/`cases.product_model` values, carried through unchanged
-    -- almost always None today, since nothing writes them yet (Stage A).
-    This is Evidence, not Inference: build_case_enrichment_input() never
-    guesses a product from question_text or anywhere else to populate
-    these -- that guess is exactly the job Stage D's LLM call has not been
-    built yet to do.
-
     Structurally requires at least one turn (see __post_init__) -- an
     empty-turns input would have nothing for any future analysis step to
     analyze. build_case_enrichment_input() already fails closed (returns
@@ -284,8 +250,6 @@ class CaseEnrichmentInput:
 
     case_id: str
     session_id: str
-    current_title: str | None
-    current_product_model: str | None
     turns: tuple[CaseTurnEvidence, ...]
     retrievals: tuple[CaseRetrievalEvidence, ...]
     feedback: tuple[CaseFeedbackEvidence, ...]
@@ -395,8 +359,6 @@ def build_case_enrichment_input(store: FeedbackStoreV2, case_id: str) -> CaseEnr
         return CaseEnrichmentInput(
             case_id=str(case_id),
             session_id=case_row["session_id"],
-            current_title=case_row["title"],
-            current_product_model=case_row["product_model"],
             turns=turns,
             retrievals=tuple(retrievals),
             feedback=feedback,
@@ -482,8 +444,8 @@ class CaseEnrichmentResult:
     product_source == "explicit_user_text" means the product model string
     can be found directly in one of CaseEnrichmentInput.turns[*].
     question_text -- the USER's own words, never the assistant's answer,
-    never retrieval telemetry, never an existing cases.title. Anything
-    else (the model synthesizing a product from Case context, retrieval
+    never retrieval telemetry. Anything else (the model synthesizing a
+    product from Case context, retrieval
     result counts, or its own prior answers) is "inference". Stage B does
     not verify the product string is actually a substring of any
     question_text -- there is no product master/parser in this repository

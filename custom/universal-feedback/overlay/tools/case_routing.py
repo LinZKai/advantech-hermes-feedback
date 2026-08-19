@@ -1,5 +1,4 @@
-"""Phase 4A: pure parser/validator for the Case Routing Control Envelope
-protocol.
+"""Pure parser/validator for the Case Routing Control Envelope protocol.
 
 The protocol asks the main Hermes model to prefix its FINAL non-tool-call
 response with a fixed, machine-readable control frame before its normal
@@ -8,56 +7,47 @@ user-visible answer::
     <case-routing>{"case_action":"existing","case_id":"case-a","confidence":0.92,"routing_version":"case-router-v1"}</case-routing>
     normal user-visible answer...
 
-This is deliberately an application-level *framed* protocol, not a natural-
-language marker to be found by scanning the final answer text: the envelope
-only has protocol meaning when it is the absolute prefix of the response
-(no leading whitespace, no earlier normal text), with a fixed opening/
-closing delimiter pair and a strict JSON schema in between. This module
-never searches for the delimiter at an arbitrary position -- doing so would
-turn this back into the "regex-guess telemetry from the final answer" shape
-Phase 3A already ruled out.
+This is deliberately an application-level *framed* protocol, not a
+natural-language marker found by scanning the final answer text: the
+envelope only has protocol meaning when it is the absolute prefix of the
+response (no leading whitespace, no earlier normal text), with a fixed
+opening/closing delimiter pair and a strict JSON schema in between. This
+module never searches for the delimiter at an arbitrary position.
 
 This module never touches a database, never does network I/O, never calls
 an LLM, and never reads environment/config. It has no notion of a Case
 actually existing in storage -- ``validate_case_routing`` accepts the
 caller-supplied set of case ids known to be valid for the current session
-(``candidate_case_ids``) as a plain argument, exactly like
-tools.retrieval_observer accepts ``boundary_trusted`` as a plain argument
-instead of ever asking the gateway/session layer for it. tools/
-retrieval_runtime.py (a later Phase 4A stage) is the glue layer that knows
-about FeedbackStoreV2 and the gateway's response envelope; it is the only
-module that should import from here.
+(``candidate_case_ids``) as a plain argument. tools/retrieval_runtime.py
+is the glue layer that knows about FeedbackStoreV2 and the gateway's
+response envelope; it is the only module that should import from here.
 
 Any failure to parse or validate the envelope is reported as a
 ``CaseRoutingResult`` with ``status="invalid"`` (envelope was present but
 broken) or ``status="absent"`` (no envelope at all) and a fixed, safe
 ``invalid_reason`` string -- never the raw exception text, the raw model
-output, or a guess at what the model "probably meant". Parsing failure must
-never fall back to inferring routing from the natural-language answer; the
-caller's own policy layer is expected to treat both ``invalid`` and
-``absent`` as "no machine-readable routing this turn" and apply its own
-conservative fallback (see Future Stage B Notes at the bottom of this file).
+output, or a guess at what the model "probably meant". Parsing failure
+must never fall back to inferring routing from the natural-language
+answer; the caller's own policy layer is expected to treat both
+``invalid`` and ``absent`` as "no machine-readable routing this turn" and
+apply its own conservative fallback.
 
-Stage A scope: this module only parses, validates, and strips the protocol
-envelope. It does not decide what to do with the result -- no Case
-creation, no confidence-threshold fallback policy, no persistence. See the
-module-level "Future Stage B Notes" docstring at the bottom of this file
-for what is intentionally deferred.
+This module only parses, validates, and strips the protocol envelope. It
+does not decide what to do with the result -- no Case creation, no
+confidence-threshold fallback policy, no persistence. See "Future Stage B
+Notes" at the bottom of this file for what is intentionally deferred.
 """
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
-from typing import Any
+
+from tools._validation import is_valid_confidence as _is_valid_confidence
 
 # ---------------------------------------------------------------------------
-# Protocol constants (Phase 4A POC policy values -- see AGENTS.md constraint
-# against introducing new config surfaces for POC-stage constants. A future
-# change to these values ships as a new ROUTING_VERSION, not a config knob;
-# see the confidence-threshold discussion in the Phase 4A implementation
-# plan for why this module does not read either from config.yaml or an env
-# var.)
+# Protocol constants -- POC policy values, deliberately not read from
+# config.yaml or an env var. A future change to these values ships as a new
+# ROUTING_VERSION, not a config knob.
 # ---------------------------------------------------------------------------
 
 ROUTING_VERSION = "case-router-v1"
@@ -143,28 +133,6 @@ class CaseRoutingResult:
 # ---------------------------------------------------------------------------
 
 
-def _is_valid_confidence(value: Any) -> bool:
-    """True only for a real, finite JSON number in [0.0, 1.0].
-
-    ``bool`` is a subclass of ``int`` in Python, so ``isinstance(True, int)``
-    is True -- checked and rejected first, otherwise ``"confidence": true``
-    would silently pass as ``1``. Python's ``json`` module also accepts the
-    non-standard tokens ``NaN``/``Infinity``/``-Infinity`` as float by
-    default (unlike strict JSON), so those are rejected explicitly too --
-    without this, a downstream ``0.0 <= confidence <= 1.0`` comparison
-    against ``nan`` would silently evaluate False for the wrong reason
-    (NaN comparisons are always False) and produce a correct-looking
-    rejection for an accidental reason rather than an intentional one.
-    """
-    if isinstance(value, bool):
-        return False
-    if not isinstance(value, (int, float)):
-        return False
-    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-        return False
-    return 0.0 <= value <= 1.0
-
-
 # ---------------------------------------------------------------------------
 # Envelope body (the JSON between the delimiters) -- protocol-level only
 # ---------------------------------------------------------------------------
@@ -239,8 +207,7 @@ def parse_case_routing_envelope(raw_envelope_text: str) -> CaseRoutingResult:
     validation (``_parse_envelope_body``). Deliberately does NOT do any
     database/known-case lookup and does NOT apply any confidence-threshold
     policy -- see ``validate_case_routing`` for the one additional,
-    session-scoped check this function cannot do on its own, and the
-    Phase 4A implementation plan / Future Stage B Notes for why the
+    session-scoped check this function cannot do on its own; the
     confidence-threshold *decision* belongs to a later stage entirely.
 
     Returns ``status="absent"`` (not ``"invalid"``) when the text does not
@@ -258,12 +225,8 @@ def parse_case_routing_envelope(raw_envelope_text: str) -> CaseRoutingResult:
         # No closing delimiter anywhere in the input. Distinguish a
         # genuinely truncated/incomplete envelope (short remainder, simply
         # never closed) from one that blew past the size safety boundary
-        # before ever closing -- both lack a close delimiter, but only the
-        # latter should be attributed to size rather than truncation, so a
-        # future streaming caller can tell "keep waiting for more chunks"
-        # apart from "give up, this is oversized" (see Stage C in the
-        # implementation plan; Stage A only needs the classification, not
-        # the buffering loop itself).
+        # before ever closing -- so a future streaming caller can tell
+        # "keep waiting for more chunks" apart from "give up, oversized".
         if len(remainder.encode("utf-8")) > MAX_ENVELOPE_PREFIX_BYTES:
             return CaseRoutingResult(status="invalid", invalid_reason=REASON_PREFIX_SIZE_EXCEEDED)
         return CaseRoutingResult(status="invalid", invalid_reason=REASON_MISSING_CLOSING_DELIMITER)
@@ -295,12 +258,11 @@ def validate_case_routing(
 
     ``confidence_threshold`` is accepted here to match the Stage B call
     contract, but this function deliberately does NOT use it to downgrade
-    ``status`` -- Stage A does not build a Case. An ``"existing"`` result
-    with ``confidence`` below the threshold is still returned with
+    ``status`` -- this stage does not build a Case. An ``"existing"``
+    result with ``confidence`` below the threshold is still returned with
     ``status="valid"``; whether to fall back to creating a new Case for a
     low-confidence match is a POLICY decision that belongs to the Stage B
-    persistence layer (see the module-level Future Stage B Notes below and
-    the Phase 4A implementation plan, section 14/"Confidence Threshold").
+    persistence layer (see the module-level Future Stage B Notes below).
     A non-numeric or out-of-range ``confidence_threshold`` is a caller
     programming error, not a data-quality problem with model output, so it
     raises ``ValueError`` immediately instead of being folded into

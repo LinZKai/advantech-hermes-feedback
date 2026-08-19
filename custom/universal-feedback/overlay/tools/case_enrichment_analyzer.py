@@ -191,8 +191,6 @@ def _serialize_case_input(case_input: CaseEnrichmentInput) -> dict[str, Any]:
     return {
         "case_id": case_input.case_id,
         "session_id": case_input.session_id,
-        "current_title": case_input.current_title,
-        "current_product_model": case_input.current_product_model,
         "evidence_watermark": case_input.evidence_watermark,
         "turns": [_serialize_turn(t) for t in case_input.turns],
         "retrievals": [_serialize_retrieval(r) for r in case_input.retrievals],

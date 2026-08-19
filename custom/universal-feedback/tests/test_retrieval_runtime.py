@@ -640,5 +640,58 @@ class NonStreamingContextSplitTests(_StoreTestCase):
         self.assertIsNone(result)
 
 
+class GetStoreRetryTests(unittest.TestCase):
+    """get_store()'s process-wide singleton must retry after a failed
+    construction attempt, never latch permanently -- a transient failure
+    (e.g. the data directory not yet mounted at process start) must not
+    wedge every turn for the rest of the process's lifetime."""
+
+    def setUp(self):
+        import tools.retrieval_runtime as rr
+        self.rr = rr
+        self._saved_singleton = rr._store_singleton
+        rr._store_singleton = None
+
+    def tearDown(self):
+        self.rr._store_singleton = self._saved_singleton
+
+    def test_failed_construction_returns_none_without_raising(self):
+        from unittest import mock
+
+        with mock.patch.object(
+            self.rr, "FeedbackStoreV2", side_effect=RuntimeError("simulated")
+        ):
+            self.assertIsNone(self.rr.get_store())
+
+    def test_next_call_after_failure_retries_and_can_succeed(self):
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def _flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated transient failure")
+            return mock.sentinel.store
+
+        with mock.patch.object(self.rr, "FeedbackStoreV2", side_effect=_flaky):
+            first = self.rr.get_store()
+            self.assertIsNone(first)
+            second = self.rr.get_store()
+            self.assertIs(second, mock.sentinel.store)
+
+    def test_successful_construction_is_cached_not_reconstructed(self):
+        from unittest import mock
+
+        with mock.patch.object(
+            self.rr, "FeedbackStoreV2", return_value=mock.sentinel.store
+        ) as constructor:
+            first = self.rr.get_store()
+            second = self.rr.get_store()
+        self.assertIs(first, mock.sentinel.store)
+        self.assertIs(second, mock.sentinel.store)
+        constructor.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

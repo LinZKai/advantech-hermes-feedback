@@ -1,4 +1,4 @@
-"""Phase 5 Slice 6B: Reflector runner, with real analysis and persistence.
+"""Reflector runner: real analysis and persistence.
 
     FeedbackStoreV2
      |
@@ -37,80 +37,46 @@ Usage:
         [--min-analyzed-cases N]
 
 Not a scheduler: manual execution only, one run of one Reflection window,
-then exit (Phase 5 Slice 6B task instruction, section 10 -- "本輪只做
-一次性的 manual runner"). No cron, no timer, no background worker, no retry/
-queue infrastructure -- deciding WHEN to run this is deliberately deferred
-to a later trigger-policy decision, made only after the full Reflector
-vertical slice has an end-to-end VM run behind it.
+then exit. No cron, no timer, no background worker, no retry/queue
+infrastructure -- deciding WHEN to run this is deliberately deferred to a
+later trigger-policy decision.
 
-Analyzer boundary (mirrors tools.run_case_enrichment's own "Analyzer
-callable, injected via a parameter" convention exactly): a run's
-ReflectionResult is produced by any `Analyzer` callable, injected via the
-`analyzer` parameter on run_reflector()/main() -- unlike tools.run_case_
-enrichment.run(), which defaults its own `analyzer` parameter to a safe,
-no-network STUB, `analyzer` here has NO default and must always be
-supplied explicitly (a caller-programming error otherwise, via a plain
-TypeError from Python itself) -- there is no existing Reflector stub
-analyzer to reuse (unlike Case Enrichment's tools.run_case_enrichment.
-analyze_case, a Stage C leftover), and inventing one is out of this
-slice's scope (Phase 5 Slice 6A/6B task instructions both explicitly rule
-out "prompt tuning" / new stub infrastructure). main() is the only place
-that binds the real analyzer (tools.reflector_analyzer.analyze_reflection_
-with_llm, via functools.partial with a resolved main_runtime) when no
-analyzer override is given -- this keeps the CLI's real-runtime wiring in
-exactly one place and keeps run_reflector() fully testable with an
-injected fake, no Hermes runtime required (matching tools.run_case_
-enrichment.main()'s exact wiring pattern).
+Analyzer boundary: a run's ReflectionResult is produced by any `Analyzer`
+callable, injected via the `analyzer` parameter on run_reflector()/main().
+Unlike tools.run_case_enrichment.run(), `analyzer` here has NO default and
+must always be supplied explicitly -- there is no existing Reflector stub
+analyzer to reuse. main() is the only place that binds the real analyzer
+(tools.reflector_analyzer.analyze_reflection_with_llm, via functools.partial
+with a resolved main_runtime) when no analyzer override is given -- this
+keeps the CLI's real-runtime wiring in exactly one place and keeps
+run_reflector() fully testable with an injected fake.
 
-ReflectionRun ownership (Phase 5 Slice 6A task instruction, section 5,
-restated here since it directly shapes this module): persist_reflection_
-result() (tools.reflector_persistence) owns the ENTIRE reflection_runs
-lifecycle -- create_reflection_run(status='running') through complete_
-reflection_run(status='succeeded'/'failed'). This module NEVER calls
-create_reflection_run() or complete_reflection_run() itself, and never
-will -- doing so would duplicate a lifecycle Slice 6A already owns
-end to end. One direct consequence (documented once, here, not
-rediscovered by a future reader as a bug): an analyzer-stage failure (see
-"Failure classification" below) produces NO reflection_runs row at all,
-because persist_reflection_result() -- the only code path that creates one
--- is never reached in that case. The failure is still fully visible in
-this run's own ReflectorRunOutcome/stdout summary/process exit code; it is
-just not durable in the DB the way a persistence-stage failure is (that
-one DOES leave a reflection_runs row, with status='failed', because
-persist_reflection_result() itself got far enough to create it before its
-own Proposal/Observation transaction failed).
+ReflectionRun ownership: persist_reflection_result() (tools.
+reflector_persistence) owns the ENTIRE reflection_runs lifecycle --
+create_reflection_run(status='running') through complete_reflection_run
+(status='succeeded'/'failed'). This module NEVER calls either of those
+itself. Consequence: an analyzer-stage failure produces NO reflection_runs
+row at all (persist_reflection_result() is never reached), whereas a
+persistence-stage failure DOES leave one, with status='failed' (because
+persist_reflection_result() got far enough to create it before its own
+Proposal/Observation transaction failed). Both are still fully visible in
+this run's own ReflectorRunOutcome/stdout summary/process exit code.
 
-Zero eligible Cases (Phase 5 Slice 6A task instruction, section 7):
-is_reflection_eligible()=False stops this run BEFORE building a
-ReflectorPromptContext, BEFORE calling the analyzer, and BEFORE any DB
-write of any kind -- reported as ReflectorRunOutcome(status=
-"no_eligible_cases"), never as a reflection_runs row. Chosen over "create
-a succeeded ReflectionRun with 0 Cases" because is_reflection_eligible()'s
-own docstring (tools.case_reflection_input) already frames it as an
-ORCHESTRATION POLICY GATE deciding "should a Reflector run proceed at
-all" -- when it says no, no Reflection Run actually happened in the
-domain sense (no evidence was shown to a model, no determination was
-made), so recording a reflection_runs row would misrepresent "we chose
-not to attempt this" as "we attempted this and found nothing", the exact
-same category error tools.case_reflection_input's own docstring already
-warns against for a different pair of numbers (window_case_count vs.
-analyzed_case_count). A reflection_runs row's meaning stays uniform: "the
-analyzer was actually invoked for this attempt."
+Zero eligible Cases: is_reflection_eligible()=False stops this run BEFORE
+building a ReflectorPromptContext, BEFORE calling the analyzer, and BEFORE
+any DB write -- reported as ReflectorRunOutcome(status="no_eligible_cases"),
+never as a reflection_runs row. A reflection_runs row's meaning stays
+uniform: "the analyzer was actually invoked for this attempt."
 
-Input-stage failure (Phase 5 Slice 6A task instruction, section 6, "Input
-/ eligibility failure"): build_reflector_input()/build_proposal_
-candidates()/build_reflector_prompt_context() are, by their own module
-docstrings, already expected not to raise for ordinary data gaps (a
-missing/unparseable Case analysis is a first-class ReflectorInput field,
-never an exception) -- but a genuine DB/connectivity failure, or (per
-tools.proposal_matching.ProposalCandidateBuildError's own docstring) a
-structurally-impossible pending-Proposal-with-no-Observation state, can
-still raise. This module wraps that whole sequence in one try/except,
-mirroring tools.run_case_enrichment._process_case's own "defensive
-belt-and-suspenders" reasoning for build_case_enrichment_input() -- and
-reports it as ReflectorRunOutcome(status="input_failed"), distinct from
-an analyzer or persistence failure, and (like "no_eligible_cases") never
-reaches the analyzer or persist_reflection_result() at all.
+Input-stage failure: build_reflector_input()/build_proposal_candidates()/
+build_reflector_prompt_context() are not expected to raise for ordinary
+data gaps (a missing/unparseable Case analysis is a first-class
+ReflectorInput field, never an exception) -- but a genuine DB/connectivity
+failure, or a structurally-impossible pending-Proposal-with-no-Observation
+state, can still raise. This module wraps that whole sequence in one
+try/except and reports it as ReflectorRunOutcome(status="input_failed"),
+distinct from an analyzer or persistence failure, and never reaches the
+analyzer or persist_reflection_result() at all.
 """
 from __future__ import annotations
 
@@ -161,23 +127,16 @@ _REQUIRED_MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key")
 
 
 def _resolve_main_runtime() -> dict[str, Any]:
-    """Read provider/model/base_url/api_key from Hermes' own config.yaml,
-    identical mechanism and identical reasoning to tools.run_case_
-    enrichment._resolve_main_runtime() (see that function's own docstring
-    for the full justification) -- deliberately a separate copy, not a
-    cross-module import, matching this whole domain's established
-    convention of never importing another module's private (leading-
-    underscore) helper across a file boundary. Reflector must analyze with
-    the SAME provider/model the main Hermes agent (and Case Enrichment) is
-    already configured with, for the same reason Case Enrichment does:
-    never a hard-coded model or provider, never a silent fallback to a
-    different one.
+    """Read provider/model/base_url/api_key from Hermes' own config.yaml
+    -- deliberately a separate copy from tools.run_case_enrichment's own
+    equivalent, not a cross-module import (this domain never imports
+    another module's private helper across a file boundary). Reflector
+    must analyze with the SAME provider/model the main Hermes agent is
+    already configured with -- never a hard-coded model, never a silent
+    fallback to a different one.
 
-    Lazy-imports hermes_cli.config so this module stays importable in this
-    repo's test environment, matching every other lazy-import boundary in
-    this domain (tools.case_enrichment_analyzer.analyze_case_with_llm's
-    agent.auxiliary_client import; tools.reflector_analyzer.analyze_
-    reflection_with_llm's own agent.auxiliary_client import).
+    Lazy-imports hermes_cli.config so this module stays importable in
+    this repo's test environment.
 
     Fails closed: raises RuntimeError if hermes_cli.config cannot be
     imported, or if config.yaml has no 'model' section, or if any of
@@ -219,9 +178,7 @@ def _resolve_main_runtime() -> dict[str, Any]:
 @dataclass(frozen=True)
 class ReflectorRunOutcome:
     """One run_reflector() call's outcome -- counts and classification
-    only, never Case/Proposal narrative content (see _format_summary),
-    matching tools.run_case_enrichment._CaseOutcome's exact "never leak
-    content, only structure" convention.
+    only, never Case/Proposal narrative content (see _format_summary).
 
     `status` is exactly one of:
       * "no_eligible_cases" -- is_reflection_eligible() said no; no LLM
@@ -243,11 +200,8 @@ class ReflectorRunOutcome:
         -- this is the one failure category that IS durable in the DB.
 
     Deliberately a plain dataclass with a `status` string, not a new
-    runner-specific exception hierarchy (Phase 5 Slice 6B task
-    instruction, section 6: "可以有一個 runner-specific error type，但不要過度
-    設計") -- run_reflector() itself never raises for any of the above; a
-    caller branches on `.status`, exactly like tools.run_case_enrichment's
-    own `_CaseOutcome.status` convention.
+    runner-specific exception hierarchy -- run_reflector() itself never
+    raises for any of the above; a caller branches on `.status`.
     """
 
     status: str
@@ -272,36 +226,24 @@ def run_reflector(
 ) -> ReflectorRunOutcome:
     """The reusable pipeline body for one Reflection Run, separated from
     CLI/argv handling so main() (or a test) can call it directly with a
-    different analyzer -- matches tools.run_case_enrichment.run()'s own
-    "pipeline body separated from CLI" shape exactly.
+    different analyzer.
 
     `window_start`/`window_end` default to None/None -- build_reflector_
-    input()'s own default (the whole Case history, no window restriction)
-    -- this module invents no different default; a caller that wants a
-    bounded window passes one explicitly. `min_analyzed_cases` defaults to
-    DEFAULT_MIN_ANALYZED_CASES_FOR_REFLECTION (tools.case_reflection_
-    input), never re-declared as a different literal here.
-
+    input()'s own default (the whole Case history, no window restriction).
     `analyzer` is required, no default -- see this module's own docstring,
     "Analyzer boundary", for why.
 
-    reflection_run_id is generated once, via uuid.uuid4().hex, matching
-    tools.run_case_enrichment._process_case's own analysis_id convention
-    exactly. `started_at` (passed to persist_reflection_result as the
-    reflection_runs row's own started_at) and `observed_at` (passed to the
-    analyzer, and from there into every Observation's own observed_at) are
-    deliberately the SAME timestamp, generated once, immediately before
-    the analyzer call -- not two independent datetime.now() calls a few
-    lines apart that would differ by an accidental few milliseconds for no
-    semantic reason. tools.reflector_persistence's own docstring already
-    establishes the precedent this follows: a create_new finding's
-    ImprovementProposal.created_at is set to the SAME value as its
-    founding Observation's observed_at for exactly the same reason (one
-    real moment, one timestamp, not two). `completed_at` IS a second,
-    later datetime.now() call, taken after the analyzer returns -- that
-    one genuinely is a different moment (the analyzer call takes real
-    wall-clock time), so a fresh timestamp there is correct, not
-    redundant.
+    reflection_run_id is generated once, via uuid.uuid4().hex. `started_at`
+    (passed to persist_reflection_result as the reflection_runs row's own
+    started_at) and `observed_at` (passed to the analyzer, and from there
+    into every Observation's own observed_at) are deliberately the SAME
+    timestamp, generated once, immediately before the analyzer call -- not
+    two independent datetime.now() calls a few lines apart that would
+    differ by an accidental few milliseconds for no semantic reason.
+    `completed_at` IS a second, later datetime.now() call, taken after the
+    analyzer returns -- that one genuinely is a different moment (the
+    analyzer call takes real wall-clock time), so a fresh timestamp there
+    is correct, not redundant.
     """
     try:
         reflector_input = build_reflector_input(store, window_start=window_start, window_end=window_end)
@@ -390,13 +332,9 @@ def run_reflector(
 
 # ---------------------------------------------------------------------------
 # Human-readable summary -- Traditional Chinese narrative, English
-# machine-facing fields (Phase 5 Slice 6B task instruction, section 9).
-# Reflector's own zh-TW language policy already lives in tools.reflector_
-# analyzer._SYSTEM_INSTRUCTIONS (Slice 6A) -- this function does no
-# translation of its own and never touches result.run_summary's content;
-# it only labels that already-zh-TW text with a handful of fixed Chinese
-# labels around it, exactly like tools.run_case_enrichment._format_summary
-# labels English fields with fixed English text.
+# machine-facing fields. This function does no translation of its own and
+# never touches result.run_summary's content; it only labels that
+# already-zh-TW text with a handful of fixed Chinese labels around it.
 # ---------------------------------------------------------------------------
 
 _STATUS_LABELS = {

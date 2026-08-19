@@ -54,11 +54,8 @@ resolved main_runtime) when no analyzer override is given -- this keeps the
 CLI's real-runtime wiring in exactly one place and keeps run()/_process_case()
 fully testable with an injected fake, no Hermes runtime required.
 
-Does not update cases.title / cases.product_model: case_analysis is
-append-only intelligence history, not the Case's own identity fields. Stage
-B.5's create_case_analysis() docstring already states this explicitly;
-Stage D2 does not change it (see that module for the deferred-to-later-stage
-Human Override policy this would require).
+case_analysis is append-only intelligence history; `cases` itself carries
+no title/product identity columns for this to update.
 """
 from __future__ import annotations
 

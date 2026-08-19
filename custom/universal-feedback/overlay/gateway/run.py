@@ -6488,6 +6488,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+        # Eagerly initialize the Phase 4 feedback/case-routing SQLite store
+        # once at startup, so a fresh onboard never needs a manual
+        # `FeedbackStoreV2(...)` construction before the first real Telegram
+        # turn: get_store() itself is idempotent (CREATE ... IF NOT EXISTS)
+        # and would otherwise only run lazily on the first candidate-case
+        # lookup. Never blocks startup on failure -- get_store() already
+        # logs a warning and every real caller fails closed on None.
+        try:
+            from tools.retrieval_runtime import get_store as _get_feedback_store
+            if _get_feedback_store() is None:
+                logger.warning(
+                    "Feedback/Case Routing store unavailable at startup -- "
+                    "will retry on the next candidate-case lookup"
+                )
+        except Exception:
+            logger.debug("Feedback store eager init failed", exc_info=True)
+
         # Log any active supply-chain security advisories. Operators see this
         # in gateway.log and `hermes status` surfaces it; we do NOT block
         # startup or surface it inline to user messages, since the gateway
@@ -19083,7 +19100,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?", _edit_err,
                         )
 
-        from tools.universal_feedback import feedback_eligible, safe_feedback_text, claim_feedback_ownership
+        from tools.universal_feedback import feedback_eligible, claim_feedback_ownership
 
         # Phase 3A telemetry: independent of the legacy hook below (never
         # gated on feedback_eligible()/claim_feedback_ownership()/
@@ -19180,17 +19197,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata={
                         "turn_key": f"telegram:{source.chat_id}:{event_message_id}",
                         "telegram_user_id": source.user_id,
-                        "session_id": session_id,
-                        "user_message_id": event_message_id,
-                        "assistant_message_id": getattr(_sc, "message_id", None),
-                        "assistant_message_id_missing": getattr(_sc, "message_id", None) is None,
-                        "foundry_iq_metadata_json": json.dumps({"assistant_message_id_missing": getattr(_sc, "message_id", None) is None}),
-                        "question_text": safe_feedback_text(message),
-                        "answer_text": safe_feedback_text(response.get("final_response")),
-                        "feedback_trigger_reason": "universal_final_answer",
-                        "feedback_policy_version": "universal-message-v1",
-                        "feedback_schema_version": "v1",
-                        "foundry_iq_attempted": 0,
                     },
                 )
             except Exception:

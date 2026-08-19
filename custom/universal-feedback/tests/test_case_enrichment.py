@@ -182,26 +182,6 @@ class InputAssemblyTests(_StoreTestCase):
         self.assertEqual(result.evidence_watermark, self.store.get_case_evidence_watermark("case-1"))
         self.assertIsNotNone(result.evidence_watermark)
 
-    def test_existing_identity_included_but_not_inferred(self):
-        self._seed_session_and_case()
-        self._add_turn("case-1", "turn-1", question="ADAM-6266 怎麼關閉 SNMP？")
-        # cases.title/product_model are still NULL -- Stage A never writes
-        # them, and nothing in build_case_enrichment_input() may guess a
-        # value from question_text to fill them in.
-        result = build_case_enrichment_input(self.store, "case-1")
-        self.assertIsNone(result.current_title)
-        self.assertIsNone(result.current_product_model)
-
-    def test_existing_identity_passed_through_unchanged_when_present(self):
-        self._seed_session_and_case()
-        self._add_turn("case-1", "turn-1")
-        import sqlite3
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("UPDATE cases SET title=?, product_model=? WHERE case_id=?", ("Existing Title", "WISE-6610", "case-1"))
-        result = build_case_enrichment_input(self.store, "case-1")
-        self.assertEqual(result.current_title, "Existing Title")
-        self.assertEqual(result.current_product_model, "WISE-6610")
-
     def test_turn_with_no_retrieval_or_feedback_yields_empty_tuples(self):
         self._seed_session_and_case()
         self._add_turn("case-1", "turn-1")
@@ -213,7 +193,6 @@ class InputAssemblyTests(_StoreTestCase):
         with self.assertRaises(ValueError):
             CaseEnrichmentInput(
                 case_id="c1", session_id="s1",
-                current_title=None, current_product_model=None,
                 turns=(), retrievals=(), feedback=(),
                 evidence_watermark="2026-01-01T00:00:00+00:00",
             )

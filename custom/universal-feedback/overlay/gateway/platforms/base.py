@@ -5053,7 +5053,7 @@ class BasePlatformAdapter(ABC):
                     # only when the response was not already handled by the
                     # streaming path. The policy helper is shared with
                     # run.py. Independent of the Phase 3A block above.
-                    from tools.universal_feedback import feedback_eligible, safe_feedback_text, claim_feedback_ownership
+                    from tools.universal_feedback import feedback_eligible, claim_feedback_ownership
                     _universal_feedback_handled = bool(
                         getattr(event, "universal_feedback_handled", False)
                     )
@@ -5082,17 +5082,6 @@ class BasePlatformAdapter(ABC):
                                 metadata={
                                     "turn_key": f"telegram:{event.source.chat_id}:{event.message_id}",
                                     "telegram_user_id": getattr(event.source, "user_id", None),
-                                    "session_id": getattr(event, "_feedback_session_id", None),
-                                    "user_message_id": getattr(event, "message_id", None),
-                                    "assistant_message_id": result.message_id,
-                                    "assistant_message_id_missing": result.message_id is None,
-                                    "foundry_iq_metadata_json": json.dumps({"assistant_message_id_missing": result.message_id is None}),
-                                    "question_text": safe_feedback_text(event.text),
-                                    "answer_text": safe_feedback_text(text_content),
-                                    "feedback_trigger_reason": "universal_final_answer",
-                                    "feedback_policy_version": "universal-message-v1",
-                                    "feedback_schema_version": "v1",
-                                    "foundry_iq_attempted": 0,
                                 },
                             )
                         except Exception:

@@ -90,8 +90,6 @@ def _make_case_input(**overrides: Any) -> CaseEnrichmentInput:
     base = dict(
         case_id="case-1",
         session_id="sess-1",
-        current_title=None,
-        current_product_model=None,
         turns=(_make_turn(),),
         retrievals=(),
         feedback=(),

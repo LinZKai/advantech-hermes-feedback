@@ -1,4 +1,4 @@
-"""Phase 5 Slice 2: the Cross-case Reflector proposal domain contract.
+"""The Cross-case Reflector proposal domain contract.
 
     ReflectorInput                    (tools.case_reflection_input, unchanged)
      |
@@ -12,23 +12,20 @@
      v
     structural validation             (each dataclass's own __post_init__)
 
-Slice 2 scope only: the typed domain contracts a future Reflector step
-produces, and the deterministic helper(s) that shape does not need an LLM
-for. No LLM call, no prompt, no matching algorithm (embedding/fuzzy/LLM),
-no persistence orchestration, no runner, no scheduler -- storage queries
-for the three new tables these contracts mirror
-(reflection_runs/improvement_proposals/proposal_observations) stay in
-tools.feedback_store_v2, matching tools.case_enrichment's own "glue, not
-storage" layering (see that module's docstring). This module issues no raw
-SQL of its own.
+The typed domain contracts a future Reflector step produces, and the
+deterministic helper(s) that shape does not need an LLM for. No LLM call,
+no prompt, no matching algorithm (embedding/fuzzy/LLM), no persistence
+orchestration, no runner, no scheduler -- storage queries for the three
+tables these contracts mirror (reflection_runs/improvement_proposals/
+proposal_observations) stay in tools.feedback_store_v2. This module issues
+no raw SQL of its own.
 
 Three distinct concepts, matching the three storage tables
-tools.feedback_store_v2 now provides (see that module's docstring for the
-full schema/lifecycle reasoning):
+tools.feedback_store_v2 provides:
 
     ReflectionRun        = one cross-Case analysis execution
                             (reflection_runs -- not modeled as a dataclass
-                            in this module; see this docstring's note below)
+                            in this module; see the note below)
     ImprovementProposal  = one persistently-tracked improvement issue,
                             awaiting human handling (identity + human
                             lifecycle only)
@@ -51,13 +48,12 @@ tools.feedback_store_v2) is a mutable batch-run bookkeeping record (started/
 completed/status/reflector_version, ...) with no independent "result
 shape" of its own to validate beyond what FeedbackStoreV2.
 create_reflection_run()/complete_reflection_run() already accept as plain
-keyword arguments -- there is no equivalent of CaseEnrichmentResult's
-structural-validation need for it. ReflectionResult below is that
-equivalent for the actual ANALYTICAL OUTPUT of a run.
+keyword arguments. ReflectionResult below is that equivalent for the
+actual ANALYTICAL OUTPUT of a run.
 
-Self-improvement boundary (Phase 5 task instruction, section 17) --
-stated explicitly, once, here, and never contradicted anywhere else in
-this module or in tools.feedback_store_v2's proposal-domain tables:
+Self-improvement boundary -- stated explicitly, once, here, and never
+contradicted anywhere else in this module or in tools.feedback_store_v2's
+proposal-domain tables:
 
     An ImprovementProposal, regardless of improvement_target, is NEVER
     permission for any code path to directly modify Hermes production
@@ -68,15 +64,15 @@ this module or in tools.feedback_store_v2's proposal-domain tables:
     configuration, prompt, KB, or Skill file, and none ever should. The
     only lifecycle this module models is: proposal -> human review
     (pending/accepted/rejected) -- draft patch, test, approval, and deploy
-    are explicitly out of scope for this slice and are not represented by
-    any field here.
+    are explicitly out of scope and are not represented by any field here.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from tools._validation import is_valid_confidence as _is_valid_confidence
+from tools._validation import require_nonblank_str as _require_nonblank_str
 from tools.feedback_store_v2 import (
     IMPROVEMENT_TARGET_VALUES,
     PROPOSAL_TREND_VALUES,
@@ -93,32 +89,6 @@ _PROPOSAL_TREND_VALUE_SET = frozenset(PROPOSAL_TREND_VALUES)
 # without pointing at concrete supporting evidence; 'no_longer_observed'
 # is the one trend that legitimately means "the evidence is now gone").
 _TRENDS_REQUIRING_SUPPORTING_CASES = frozenset(PROPOSAL_TREND_VALUES) - {"no_longer_observed"}
-
-
-def _is_valid_confidence(value: Any) -> bool:
-    """True only for a real, finite number in [0.0, 1.0].
-
-    Deliberately its own local copy rather than importing tools.
-    feedback_store_v2._is_valid_confidence, tools.case_enrichment.
-    _is_valid_confidence, or tools.case_reflection_input.
-    _is_valid_confidence -- none of those modules export it, and each of
-    them already independently keeps its own copy of this exact check
-    rather than reaching across a module boundary at a private,
-    leading-underscore helper (see each of their own docstrings for this
-    same reasoning). This module follows the same established convention.
-    """
-    if isinstance(value, bool):
-        return False
-    if not isinstance(value, (int, float)):
-        return False
-    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-        return False
-    return 0.0 <= value <= 1.0
-
-
-def _require_nonblank_str(value: Any, field_name: str) -> None:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field_name} must be a non-blank string, got {value!r}")
 
 
 def _require_optional_str(value: Any, field_name: str) -> None:
@@ -162,7 +132,7 @@ class ImprovementProposal:
     lifecycle (review_status) -- nothing that changes on every
     re-observation (pattern_summary, recommended_improvement, confidence,
     trend, supporting Cases, ...) belongs here; all of that lives on
-    ProposalObservation instead (Phase 5 task instruction, section 6).
+    ProposalObservation instead.
 
     Only one timestamp (created_at), not a separate first_detected_at:
     within this slice's actual code paths, a Proposal is only ever created
@@ -215,9 +185,8 @@ class ProposalObservation:
     is always a new ProposalObservation, matching tools.feedback_store_v2.
     create_proposal_observation()'s exact append-only storage contract).
 
-    Five narrative fields carry the actual "small improvement report"
-    (Phase 5 task instruction, section 8) -- each a full-paragraph string,
-    never an artificially short label:
+    Five narrative fields carry the actual "small improvement report" --
+    each a full-paragraph string, never an artificially short label:
 
         pattern_summary          - REQUIRED. What was observed.
         possible_cause            - OPTIONAL (nullable). See below.
@@ -263,8 +232,7 @@ class ProposalObservation:
     a non-empty duplicate. supporting_case_count must equal
     len(supporting_case_ids) exactly.
 
-    Zero supporting Cases (Phase 5 task instruction, section 9): allowed
-    ONLY when trend='no_longer_observed' (the one trend that legitimately
+    Zero supporting Cases: allowed ONLY when trend='no_longer_observed' (the one trend that legitimately
     means "no current evidence") -- every other trend value fails closed
     and requires at least one supporting_case_id, since claiming a pattern
     is new/growing/stable/declining with zero cited evidence would not be
@@ -342,8 +310,8 @@ class ReflectionResult:
     A Reflection Run finding NOTHING worth proposing is a fully legal,
     successful result -- this dataclass never forces "at least one
     proposal": material_change_detected=False, new_proposals=(),
-    proposal_observations=() together are valid (Phase 5 task instruction,
-    section 10), with run_summary carrying a real sentence either way
+    proposal_observations=() together are valid, with run_summary carrying
+    a real sentence either way
     (e.g. "本次 analysis horizon 未發現具有實質新意義的 recurring pattern。") --
     run_summary is REQUIRED regardless of outcome, since even a "nothing
     found" result needs a real, human-readable summary of that fact.

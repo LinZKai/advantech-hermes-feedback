@@ -1,114 +1,38 @@
-"""SQLite storage for the Session -> Case -> Turn -> {Retrieval Run, Feedback}
-schema (v2).
+"""SQLite storage for the Session -> Case -> Turn -> {Retrieval Run,
+Feedback, Case Analysis} -> {Reflection Run, Improvement Proposal} schema
+(v2): sessions, cases, turns, retrieval_runs, feedback, case_analysis,
+reflection_runs, improvement_proposals, proposal_observations.
 
-This is deliberately a separate module from tools.feedback_storage, which
-keeps serving the legacy `feedback_runs` table unchanged. Migration 002
-(see ../migrations/002_feedback_schema_v2.sql) is purely additive: it adds
-five new tables to the same database file feedback_storage.DEFAULT_PATH
-already points at, alongside the untouched legacy table.
+Deliberately a separate module from tools.feedback_storage, which keeps
+serving the legacy `feedback_runs` table (a different, Telegram-callback-
+authorization-shaped table) in the same database file. See ../migrations/
+*.sql for how this schema arrived at its current shape -- those files are
+history/documentation only; _SCHEMA_STATEMENTS below is the only thing
+this module actually executes, and always creates every table directly in
+its current, final shape (CREATE ... IF NOT EXISTS).
 
-Phase 2 scope only: this module provides the schema and storage API. It is
-not wired into the gateway, the Telegram adapter, or any messages parser --
-callers (a later phase) are responsible for deciding what to write and when.
+This module is the taxonomy authority for every CHECK-constrained enum
+column: DIAGNOSIS_VALUES/ISSUE_TYPE_VALUES/PRODUCT_SOURCE_VALUES (case_
+analysis) and IMPROVEMENT_TARGET_VALUES/REVIEW_STATUS_VALUES/PROPOSAL_
+TREND_VALUES/REFLECTION_RUN_STATUS_VALUES (the Reflector tables) -- other
+modules import these from here rather than maintaining their own copies.
 
-Migration 003 (see ../migrations/003_retrieval_execution_statuses.sql,
-Phase 3A): widens retrieval_runs.execution_status to also allow 'blocked'
-and 'unparseable'. 002_feedback_schema_v2.sql itself is never edited to
-reflect this -- it stays byte-for-byte what Phase 2 commit 099abb5
-originally created, so migration history stays traceable. _SCHEMA_STATEMENTS
-below creates a brand-new database directly in the post-003 shape (a fresh
-CREATE TABLE IF NOT EXISTS is a no-op against an existing table regardless
-of its CHECK constraint, so this alone would silently fail to widen an
-*existing* v2 database); _migrate_schema() separately runs
-_upgrade_retrieval_runs_execution_statuses() to detect and rebuild an
-existing pre-003 retrieval_runs table in place, using SQLite's own
-documented 12-step ALTER TABLE recipe (SQLite has no ALTER TABLE ... DROP/
-ADD CONSTRAINT).
+Two invariants worth knowing before editing this module:
 
-Migration 004 (see ../migrations/004_case_analysis.sql, Phase 4.5 Stage A):
-adds a new, purely-additive `case_analysis` table -- one append-only row per
-analysis run for a Case (never updated in place; re-analysis is always a new
-row, so history is never lost). Unlike migration 003, this needs no rebuild
-step: CREATE TABLE IF NOT EXISTS is sufficient and idempotent for a table
-that never existed before, on both a brand-new database and an existing one
-already at the 002/003 shape. Stage A only adds the schema and query
-surface below -- no LLM call, no enrichment service, and no runner exist
-yet; those are later stages.
+  * case_analysis and proposal_observations are append-only: a re-analysis
+    or re-observation is always a new row (never an UPDATE), so history is
+    never lost. reflection_runs is the one mutable table -- created with
+    status='running', then a single terminal transition to 'succeeded'/
+    'failed' via complete_reflection_run().
 
-Migration 005 (see ../migrations/005_case_analysis_taxonomy_alignment.sql,
-Phase 4.5 Stage B.5 Schema Alignment): rebuilds `case_analysis` so it
-matches the finalized Stage B tools.case_enrichment.CaseEnrichmentResult
-contract -- narrows `diagnosis` from 6 values to 5 (drops
-'workflow_tool_issue', renames 'unclear_or_other' to 'other_or_unclear'),
-adds NOT NULL `issue_type`/`issue_type_confidence`, and adds range CHECK
-constraints (0.0-1.0) to all three confidence columns. This module is now
-the taxonomy authority for DIAGNOSIS_VALUES/ISSUE_TYPE_VALUES/
-PRODUCT_SOURCE_VALUES -- tools.case_enrichment imports all three from here
-rather than maintaining its own copies. Like migration 003 (and unlike
-004), this needs the full rebuild recipe, because it changes an existing
-CHECK constraint and tightens existing columns to NOT NULL, not just adds
-new tables. See _upgrade_case_analysis_taxonomy() below for the legacy-data
-handling this rebuild applies (never a silent guess at Issue Type for
-pre-existing rows -- see that method's docstring).
-
-Phase 5 Slice 1 (Cross-case Reflector input foundation): adds two new
-read-only query methods, list_case_ids_created_in_window() and
-list_latest_case_analysis() -- no schema change, no migration; both tables
-they read (cases, case_analysis) are unchanged. Each is a general-purpose,
-single-responsibility primitive (Case-creation-time filtering; latest-
-analysis-per-Case batch lookup) -- neither method knows about the other,
-about Reflector, or about any notion of an "analysis window"; that
-composition lives in tools.case_reflection_input, which calls both. See
-each method's own docstring for its exact semantics.
-
-Migration 006 (see ../migrations/006_reflector_proposal_domain.sql, Phase 5
-Slice 2): adds three new, purely-additive tables -- reflection_runs,
-improvement_proposals, proposal_observations. Like migration 004, this
-needs no rebuild step: every table is brand new, so CREATE TABLE IF NOT
-EXISTS is sufficient and idempotent for both a fresh database and an
-existing one already at the 002/003/004/005 shape.
-
-  * reflection_runs is a mutable batch-run record (create with
-    status='running', then a single terminal transition to 'succeeded' or
-    'failed' via complete_reflection_run()) -- NOT append-only, unlike
-    case_analysis/proposal_observations, because a run is one ongoing
-    activity with exactly one lifecycle, not a history of independent
-    snapshots. Mirrors update_turn_retrieval_observation()'s existing
-    "validated UPDATE, rowcount==1" convention -- the only other row-
-    mutation precedent already in this module.
-
-  * improvement_proposals is "identity + human lifecycle": created once,
-    per detected recurring pattern, and its review_status
-    (pending/accepted/rejected) is later moved by a HUMAN reviewer via
-    update_proposal_review_status() -- never by any AI/Reflector code
-    path. Nothing in this module enforces that boundary at the type
-    level (a Python caller could call it from anywhere); it is a process
-    boundary, documented here and in tools.reflector_proposals.
-
-  * proposal_observations is append-only, exactly like case_analysis:
-    one row per (proposal_id, reflection_run_id) pair (UNIQUE constraint,
-    same purpose as case_analysis's own append-only design -- history is
-    never lost, re-observation is always a new row), plus a second
-    UNIQUE(proposal_id, observed_at) that makes get_latest_proposal_
-    observation()/list_latest_proposal_observations()'s "ORDER BY
-    observed_at DESC" unambiguous for any one proposal_id, mirroring
-    case_analysis's own UNIQUE(case_id, analyzed_at) tie-elimination
-    exactly.
-
-This module is now also the taxonomy authority for IMPROVEMENT_TARGET_
-VALUES/REVIEW_STATUS_VALUES/PROPOSAL_TREND_VALUES/REFLECTION_RUN_STATUS_
-VALUES -- tools.reflector_proposals imports all four from here rather
-than maintaining its own copies, matching tools.case_enrichment's existing
-relationship to this module's case_analysis taxonomy constants.
-
-Slice 2 scope only: schema and storage query surface. No LLM, no matching
-algorithm, no runner, no scheduler exist yet -- see
-tools.reflector_proposals for the typed domain contracts these tables
-persist.
+  * improvement_proposals.review_status (pending/accepted/rejected) is a
+    HUMAN lifecycle field: moved only by a human reviewer via
+    update_proposal_review_status(), never by any AI/Reflector code path.
+    Nothing here enforces that boundary at the type level -- it is a
+    process boundary, documented here and in tools.reflector_proposals.
 """
 from __future__ import annotations
 
-import math
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -116,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Collection, Mapping
 
+from tools._validation import is_valid_confidence as _is_valid_confidence
 from tools.feedback_callbacks import REASON_CODES, is_valid_reason_code
 from tools.feedback_storage import DEFAULT_PATH, MAX_SUGGESTION_TEXT_LENGTH
 from tools.universal_feedback import safe_feedback_text
@@ -268,28 +193,6 @@ _REFLECTION_RUN_STATUS_VALUE_SET = frozenset(REFLECTION_RUN_STATUS_VALUES)
 _REFLECTION_RUN_TERMINAL_STATUS_VALUE_SET = frozenset({"succeeded", "failed"})
 
 
-def _is_valid_confidence(value: Any) -> bool:
-    """True only for a real, finite number in [0.0, 1.0].
-
-    Mirrors the same defensive pattern independently maintained in
-    tools.case_routing._is_valid_confidence and (until this alignment)
-    tools.case_enrichment._is_valid_confidence -- bool is rejected before
-    the int check (bool is an int subclass in Python, so `True` would
-    otherwise silently pass as confidence=1), and non-standard JSON tokens
-    NaN/Infinity/-Infinity (which Python's json module accepts by default)
-    are rejected explicitly. This module keeps its own copy rather than
-    importing either of those modules' leading-underscore helpers --
-    neither exports it, and this storage-layer boundary should not depend
-    on either higher-level module to validate a primitive value.
-    """
-    if isinstance(value, bool):
-        return False
-    if not isinstance(value, (int, float)):
-        return False
-    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-        return False
-    return 0.0 <= value <= 1.0
-
 # Fixed, safe reason stored on turns.retrieval_observation_reason when a
 # retrieval-insert batch fails and is rolled back -- never the underlying
 # exception's own text, which is not a value this module controls.
@@ -309,8 +212,6 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS cases (
         case_id       TEXT PRIMARY KEY,
         session_id    TEXT NOT NULL REFERENCES sessions(session_id),
-        title         TEXT,
-        product_model TEXT,
         created_at    TEXT NOT NULL,
         updated_at    TEXT NOT NULL,
         -- Referenced by turns' composite FK below. case_id alone is
@@ -615,168 +516,6 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_proposal_observations_run ON proposal_observations(reflection_run_id)",
 )
 
-# Migration 003 (see ../migrations/003_retrieval_execution_statuses.sql):
-# rebuild retrieval_runs in place to widen its execution_status CHECK
-# constraint to also allow 'blocked'/'unparseable', for a database whose
-# retrieval_runs table was already created under the original (Phase 2,
-# commit 099abb5) 002 migration. SQLite has no `ALTER TABLE ... DROP/ADD
-# CONSTRAINT`, so this is the standard 12-step ALTER TABLE recipe: create a
-# shadow table with the new constraint, copy every row unchanged, drop the
-# old table, rename the shadow table into place, recreate its indexes.
-# Column list is explicit (never `SELECT *`) so a future column addition to
-# one side can't silently misalign with the other. Never touches
-# feedback_runs, sessions, cases, turns, or feedback.
-_RETRIEVAL_RUNS_REBUILD_COLUMNS = (
-    "retrieval_id, turn_id, invocation_order, tool_call_id, "
-    "request_attempted, execution_status, foundry_iq_ok, "
-    "observation_status, observation_reason, "
-    "error_code, http_status, result_count, reference_count, "
-    "foundry_schema_version, created_at"
-)
-
-_RETRIEVAL_RUNS_REBUILD_STATEMENTS: tuple[str, ...] = (
-    """
-    CREATE TABLE retrieval_runs_new (
-        retrieval_id           TEXT PRIMARY KEY,
-        turn_id                TEXT NOT NULL REFERENCES turns(turn_id),
-        invocation_order       INTEGER NOT NULL,
-        tool_call_id           TEXT,
-
-        request_attempted      INTEGER CHECK (request_attempted IN (0, 1)),
-        execution_status        TEXT NOT NULL CHECK (execution_status IN (
-            'completed', 'failed', 'timed_out', 'http_error',
-            'network_error', 'invalid_response', 'no_documents', 'unknown',
-            'blocked', 'unparseable'
-        )),
-        foundry_iq_ok            INTEGER CHECK (foundry_iq_ok IN (0, 1)),
-        observation_status       TEXT NOT NULL
-            CHECK (observation_status IN ('complete', 'partial', 'unavailable')),
-        observation_reason       TEXT,
-
-        error_code                TEXT,
-        http_status                INTEGER CHECK (http_status IS NULL OR (http_status BETWEEN 100 AND 599)),
-        result_count                INTEGER,
-        reference_count               INTEGER,
-        foundry_schema_version          TEXT,
-
-        created_at TEXT NOT NULL,
-
-        UNIQUE (turn_id, invocation_order)
-    )
-    """,
-    f"INSERT INTO retrieval_runs_new ({_RETRIEVAL_RUNS_REBUILD_COLUMNS}) "
-    f"SELECT {_RETRIEVAL_RUNS_REBUILD_COLUMNS} FROM retrieval_runs",
-    "DROP TABLE retrieval_runs",
-    "ALTER TABLE retrieval_runs_new RENAME TO retrieval_runs",
-    "CREATE INDEX IF NOT EXISTS idx_retrieval_runs_turn ON retrieval_runs(turn_id)",
-)
-
-# A pre-003 retrieval_runs table's own CREATE TABLE text (recorded verbatim
-# in sqlite_master.sql) cannot contain either of these literals -- the
-# original 002 migration's CHECK constraint enumerates exactly the 8
-# pre-003 values. BOTH markers must be present for the table to count as
-# fully upgraded: checking only one (e.g. only 'blocked') would treat an
-# abnormal partial/hand-edited schema that has 'blocked' but not
-# 'unparseable' as already-complete and skip the rebuild, silently leaving
-# 'unparseable' inserts to fail their CHECK constraint forever. Detection
-# is on the live table's actual recorded DDL, never on a separately-
-# tracked "migrations applied" version number, so it stays correct even if
-# this module's own history of migrations is ever replayed out of order or
-# against a hand-edited database.
-_EXECUTION_STATUS_UPGRADE_MARKERS = ("'blocked'", "'unparseable'")
-
-# Migration 005 (see ../migrations/005_case_analysis_taxonomy_alignment.sql):
-# rebuild case_analysis in place to align it with the finalized Stage B
-# CaseEnrichmentResult contract -- narrows diagnosis to 5 values, adds NOT
-# NULL issue_type/issue_type_confidence, and adds range CHECK constraints to
-# all three confidence columns. Same recipe as migration 003 (SQLite has no
-# `ALTER TABLE ... DROP/ADD CONSTRAINT`, so a CHECK/NOT NULL change requires
-# the shadow-table rebuild), but unlike 003's straight unchanged-row copy,
-# this INSERT...SELECT also TRANSFORMS legacy data -- see
-# FeedbackStoreV2._upgrade_case_analysis_taxonomy()'s docstring for the
-# exact, documented (never silently guessed) legacy-value handling:
-#   * diagnosis 'unclear_or_other'   -> 'other_or_unclear' (pure rename)
-#   * diagnosis 'workflow_tool_issue' -> 'other_or_unclear' (lossy downgrade;
-#     the new taxonomy has no workflow/tool-specific bucket)
-#   * diagnosis_confidence NULL      -> 0.0 (explicit fallback sentinel;
-#     the old API accepted a missing confidence, the new contract does not)
-#   * issue_type / issue_type_confidence did not exist before this
-#     migration -> every pre-existing row gets the fixed fallback
-#     ('other_or_unclear', 0.0), never a value inferred from case_title/
-#     issue_summary -- a migration must never fabricate an AI classification.
-# Never touches feedback_runs, sessions, cases, turns, feedback, or
-# retrieval_runs.
-_CASE_ANALYSIS_REBUILD_STATEMENTS: tuple[str, ...] = (
-    """
-    CREATE TABLE case_analysis_new (
-        analysis_id TEXT PRIMARY KEY,
-        case_id     TEXT NOT NULL REFERENCES cases(case_id),
-
-        case_title      TEXT,
-        issue_summary   TEXT,
-
-        issue_type            TEXT NOT NULL CHECK (issue_type IN (
-            'product_usage_or_application', 'product_capability_or_compatibility',
-            'product_issue', 'other_or_unclear'
-        )),
-        issue_type_confidence REAL NOT NULL CHECK (
-            issue_type_confidence >= 0.0 AND issue_type_confidence <= 1.0
-        ),
-
-        diagnosis            TEXT NOT NULL CHECK (diagnosis IN (
-            'knowledge_gap', 'retrieval_issue', 'answer_quality_issue',
-            'other_or_unclear', 'no_issue_detected'
-        )),
-        diagnosis_confidence REAL NOT NULL CHECK (
-            diagnosis_confidence >= 0.0 AND diagnosis_confidence <= 1.0
-        ),
-
-        product_model      TEXT,
-        product_source      TEXT CHECK (
-            product_source IN ('explicit_user_text', 'inference')
-            OR product_source IS NULL
-        ),
-        product_confidence  REAL CHECK (
-            product_confidence IS NULL
-            OR (product_confidence >= 0.0 AND product_confidence <= 1.0)
-        ),
-
-        evidence_json TEXT,
-
-        analysis_version TEXT NOT NULL,
-        analyzed_at      TEXT NOT NULL,
-
-        source_evidence_watermark TEXT NOT NULL,
-
-        UNIQUE (case_id, analyzed_at)
-    )
-    """,
-    """
-    INSERT INTO case_analysis_new (
-        analysis_id, case_id, case_title, issue_summary,
-        issue_type, issue_type_confidence,
-        diagnosis, diagnosis_confidence,
-        product_model, product_source, product_confidence,
-        evidence_json, analysis_version, analyzed_at, source_evidence_watermark
-    )
-    SELECT
-        analysis_id, case_id, case_title, issue_summary,
-        'other_or_unclear', 0.0,
-        CASE
-            WHEN diagnosis IN ('unclear_or_other', 'workflow_tool_issue') THEN 'other_or_unclear'
-            ELSE diagnosis
-        END,
-        COALESCE(diagnosis_confidence, 0.0),
-        product_model, product_source, product_confidence,
-        evidence_json, analysis_version, analyzed_at, source_evidence_watermark
-    FROM case_analysis
-    """,
-    "DROP TABLE case_analysis",
-    "ALTER TABLE case_analysis_new RENAME TO case_analysis",
-    "CREATE INDEX IF NOT EXISTS idx_case_analysis_case ON case_analysis(case_id)",
-)
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -835,210 +574,27 @@ class FeedbackStoreV2:
         return db
 
     def _migrate_schema(self) -> None:
-        """Idempotently create the v2 tables/indexes, then apply migration
-        003 (widen retrieval_runs.execution_status) if needed.
+        """Idempotently create every v2 table/index in its current shape.
 
         Every statement in _SCHEMA_STATEMENTS is CREATE ... IF NOT EXISTS,
-        so re-running this (e.g. on every process start, matching
-        FeedbackStore's own _migrate_schema convention) against a database
-        that already has these tables, or against one that only has the
-        legacy 001 schema applied, is always safe. Never touches
-        feedback_runs.
+        so re-running this on every process start against a database that
+        already has these tables (in any shape) is always safe. Never
+        touches feedback_runs.
 
-        On a brand-new database, _SCHEMA_STATEMENTS already creates
-        retrieval_runs directly in the post-003 shape, so the upgrade step
-        below is a no-op there; it only does real work against a database
-        whose retrieval_runs table was already created under the original
-        (pre-003) 002 migration.
+        This is a POC whose data can always be discarded and reinitialized
+        -- there is no in-place rebuild machinery here for a database
+        still at an older column set/CHECK constraint. A stale dev
+        database predating a schema change simply keeps its old shape
+        (CREATE TABLE IF NOT EXISTS is a no-op against an existing table)
+        rather than being reconciled column-by-column at every startup;
+        delete the file and let it recreate if that matters. See
+        ../migrations/*.sql for how the schema arrived at its current
+        shape -- those files are history/documentation only and are never
+        executed by this module.
         """
         with self._connect() as db:
             for statement in _SCHEMA_STATEMENTS:
                 db.execute(statement)
-        self._upgrade_retrieval_runs_execution_statuses()
-        self._upgrade_case_analysis_taxonomy()
-
-    def _retrieval_runs_needs_execution_status_upgrade(self, db: sqlite3.Connection) -> bool:
-        """Detect an existing pre-003 retrieval_runs table by inspecting
-        its own recorded CREATE TABLE text in sqlite_master -- never a
-        separately-tracked "migrations applied" version number, so this
-        stays correct even against a database whose migration history
-        this module did not itself apply. Returns False (nothing to do)
-        both when the table already has the widened constraint (BOTH
-        'blocked' and 'unparseable' present -- checking only one would
-        wrongly treat an abnormal partial schema as fully upgraded) AND
-        when the table does not exist yet at all (a fresh database,
-        already created in the post-003 shape by _SCHEMA_STATEMENTS
-        above)."""
-        row = db.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='retrieval_runs'"
-        ).fetchone()
-        if row is None:
-            return False
-        sql_text = row[0] or ""
-        return not all(marker in sql_text for marker in _EXECUTION_STATUS_UPGRADE_MARKERS)
-
-    def _upgrade_retrieval_runs_execution_statuses(self) -> None:
-        """Migration 003 (see ../migrations/003_retrieval_execution_statuses.sql):
-        rebuild retrieval_runs in place so its execution_status CHECK
-        constraint also allows 'blocked'/'unparseable'.
-
-        Uses a dedicated connection with explicit BEGIN IMMEDIATE / COMMIT /
-        ROLLBACK (rather than self._connect()'s implicit-transaction
-        `with db:` convention used elsewhere in this class), because
-        `PRAGMA foreign_keys` can only be changed outside an open
-        transaction -- it must be turned off *before* BEGIN and back on
-        *after* COMMIT/ROLLBACK, which the implicit-transaction pattern
-        cannot express. Every retrieval_runs row is copied across
-        unchanged via an explicit column list (never `SELECT *`); indexes
-        are recreated by name after the rename since dropping a table also
-        drops its indexes. `PRAGMA foreign_key_check` is verified before
-        COMMIT; any failure at any step (including a RETRIEVAL_RUNS_new
-        table left over from a previous failed attempt -- IF NOT EXISTS on
-        its own CREATE TABLE statement -- see below) rolls back the whole
-        transaction, leaving the original retrieval_runs table and its
-        data completely untouched. Never touches feedback_runs, sessions,
-        cases, turns, or feedback.
-        """
-        db = sqlite3.connect(self.path)
-        try:
-            db.row_factory = sqlite3.Row
-            db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-            if not self._retrieval_runs_needs_execution_status_upgrade(db):
-                return
-            db.execute("PRAGMA foreign_keys=OFF")
-            try:
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    # DROP TABLE IF EXISTS guards a shadow table left over
-                    # from an earlier attempt that failed after creating it
-                    # but before this same transaction could complete (the
-                    # failed attempt's own ROLLBACK already undid the DROP/
-                    # RENAME/INSERT below, but a table created *outside* any
-                    # transaction would not roll back -- CREATE TABLE here
-                    # runs inside BEGIN IMMEDIATE, so in practice this is
-                    # defensive belt-and-suspenders, not a known gap).
-                    db.execute("DROP TABLE IF EXISTS retrieval_runs_new")
-                    for statement in _RETRIEVAL_RUNS_REBUILD_STATEMENTS:
-                        db.execute(statement)
-                    violations = db.execute(
-                        "PRAGMA foreign_key_check(retrieval_runs)"
-                    ).fetchall()
-                    if violations:
-                        raise sqlite3.IntegrityError(
-                            f"retrieval_runs rebuild left {len(violations)} "
-                            "foreign_key_check violation(s)"
-                        )
-                except Exception:
-                    db.execute("ROLLBACK")
-                    raise
-                else:
-                    db.execute("COMMIT")
-            finally:
-                db.execute("PRAGMA foreign_keys=ON")
-        finally:
-            db.close()
-
-    def _case_analysis_needs_taxonomy_upgrade(self, db: sqlite3.Connection) -> bool:
-        """Detect a case_analysis table still at the pre-Stage-B.5
-        (migration 004) shape.
-
-        Unlike _retrieval_runs_needs_execution_status_upgrade (which reads
-        the live CHECK constraint text out of sqlite_master.sql, because
-        migration 003 changes a CHECK without changing the column set),
-        this checks column presence via PRAGMA table_info -- sufficient
-        and simpler here because migration 005 also adds real columns
-        (issue_type/issue_type_confidence), so there is no scenario where
-        the columns already exist but the CHECK is still stale on its own.
-        Returns False (nothing to do) both when already upgraded AND when
-        the table does not exist yet at all (a fresh database, already
-        created in the latest shape by _SCHEMA_STATEMENTS above).
-        """
-        cols = {row["name"] for row in db.execute("PRAGMA table_info(case_analysis)").fetchall()}
-        if not cols:
-            return False
-        return "issue_type" not in cols
-
-    def _upgrade_case_analysis_taxonomy(self) -> None:
-        """Migration 005 (see
-        ../migrations/005_case_analysis_taxonomy_alignment.sql): rebuild
-        case_analysis in place to match the finalized Stage B
-        CaseEnrichmentResult contract -- narrows diagnosis to 5 values,
-        adds NOT NULL issue_type/issue_type_confidence, and adds range
-        CHECK constraints to all three confidence columns.
-
-        Same rebuild choreography as
-        _upgrade_retrieval_runs_execution_statuses (migration 003): a
-        dedicated connection, PRAGMA foreign_keys turned OFF before BEGIN
-        and back ON after COMMIT/ROLLBACK (in a finally), BEGIN IMMEDIATE,
-        a shadow table, an explicit-column INSERT...SELECT (never
-        `SELECT *`), DROP + RENAME, the index recreated by name, and
-        PRAGMA foreign_key_check verified before COMMIT -- any failure at
-        any step rolls back the whole transaction, leaving the original
-        case_analysis table and its data completely untouched.
-
-        Legacy data handling in the INSERT...SELECT
-        (_CASE_ANALYSIS_REBUILD_STATEMENTS) -- every case documented, none
-        silently guessed:
-          * diagnosis 'unclear_or_other' -> 'other_or_unclear': a pure
-            rename, same meaning, per the finalized Stage B taxonomy.
-          * diagnosis 'workflow_tool_issue' -> 'other_or_unclear': a real,
-            intentional LOSSY downgrade, not a semantic-equivalence rename
-            -- the new taxonomy has no workflow/tool-specific bucket at
-            all. This is the documented product decision for this
-            migration (see migrations/005_case_analysis_taxonomy_alignment.sql),
-            not something inferred here.
-          * diagnosis_confidence NULL -> 0.0: the pre-alignment
-            create_case_analysis() accepted a missing confidence
-            (diagnosis_confidence was optional); the new contract requires
-            it. 0.0 is an explicit fallback sentinel for "this row predates
-            the NOT NULL requirement", never a claim that the original
-            analysis actually reported zero confidence.
-          * issue_type/issue_type_confidence did not exist before this
-            migration, so every pre-existing row gets the fixed fallback
-            ('other_or_unclear', 0.0) -- NEVER a value inferred from
-            case_title/issue_summary. A migration must not fabricate an AI
-            classification a row never actually received; the fixed
-            fallback honestly represents "this row was never classified
-            for Issue Type."
-
-        Never touches feedback_runs, sessions, cases, turns, feedback, or
-        retrieval_runs.
-        """
-        db = sqlite3.connect(self.path)
-        try:
-            db.row_factory = sqlite3.Row
-            db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-            if not self._case_analysis_needs_taxonomy_upgrade(db):
-                return
-            db.execute("PRAGMA foreign_keys=OFF")
-            try:
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    # DROP TABLE IF EXISTS guards a shadow table left over
-                    # from an earlier attempt that failed after creating
-                    # it but before this same transaction could complete
-                    # -- same defensive belt-and-suspenders as the
-                    # retrieval_runs rebuild above.
-                    db.execute("DROP TABLE IF EXISTS case_analysis_new")
-                    for statement in _CASE_ANALYSIS_REBUILD_STATEMENTS:
-                        db.execute(statement)
-                    violations = db.execute(
-                        "PRAGMA foreign_key_check(case_analysis)"
-                    ).fetchall()
-                    if violations:
-                        raise sqlite3.IntegrityError(
-                            f"case_analysis rebuild left {len(violations)} "
-                            "foreign_key_check violation(s)"
-                        )
-                except Exception:
-                    db.execute("ROLLBACK")
-                    raise
-                else:
-                    db.execute("COMMIT")
-            finally:
-                db.execute("PRAGMA foreign_keys=ON")
-        finally:
-            db.close()
 
     # -- sessions -------------------------------------------------------
 
@@ -1074,22 +630,15 @@ class FeedbackStoreV2:
 
     # -- cases ------------------------------------------------------------
 
-    def create_case(
-        self,
-        case_id: str,
-        session_id: str,
-        *,
-        title: str | None = None,
-        product_model: str | None = None,
-    ) -> str:
+    def create_case(self, case_id: str, session_id: str) -> str:
         now = _now()
         with self._connect() as db:
             db.execute(
                 """
-                INSERT INTO cases (case_id, session_id, title, product_model, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO cases (case_id, session_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
                 """,
-                (str(case_id), str(session_id), title, product_model, now, now),
+                (str(case_id), str(session_id), now, now),
             )
         return str(case_id)
 
@@ -1578,10 +1127,8 @@ class FeedbackStoreV2:
         duplicate (case_id, analyzed_at) pair (UNIQUE violation) -- e.g. a
         caller retrying with the same analyzed_at it already used.
 
-        Does not touch cases.title / cases.product_model -- deciding
-        whether/how an analysis result should update the Case's own
-        identity fields is deferred to a later stage (Human Override
-        policy is explicitly out of scope for this alignment).
+        `cases` has no title/product_model columns of its own to update --
+        this table is the sole source of a Case's semantic identity.
         """
         if issue_type not in _ISSUE_TYPE_VALUE_SET:
             return False
@@ -1706,38 +1253,21 @@ class FeedbackStoreV2:
     ) -> list[str]:
         """Every case_id whose cases.created_at falls in
         [created_from, created_before) -- a pure Case-identity/creation-time
-        filter. Does not touch case_analysis, evidence, or any other table;
-        has no notion of "stale", "analyzed", or Reflector.
+        filter. Does not touch case_analysis, evidence, or any other table.
 
-        Half-open window, matching the conventional [start, end) shape:
-        created_from is INCLUSIVE (created_at >= created_from),
-        created_before is EXCLUSIVE (created_at < created_before) -- so two
-        adjacent windows (e.g. consecutive weekly batches) never overlap
-        and never leave a gap at the shared boundary timestamp.
+        Half-open window: created_from is INCLUSIVE, created_before is
+        EXCLUSIVE -- so two adjacent windows never overlap and never leave
+        a gap at the shared boundary timestamp. created_from=None means no
+        lower bound; created_before=None means no upper bound.
 
-        created_from=None means no lower bound; created_before=None means
-        no upper bound; both None returns every Case's id. Comparison is
-        lexical TEXT comparison against the same ISO-8601
-        (datetime.now(timezone.utc).isoformat(), fixed UTC offset) shape
-        every other *_at column in this module already uses -- see
-        get_case_evidence_watermark's docstring for why plain string
-        comparison is safe for this timestamp shape.
+        Deliberately does NOT know about case_analysis -- a caller wanting
+        "latest analysis for Cases created in this window" composes this
+        with list_latest_case_analysis explicitly, so this stays a
+        general-purpose Case-identity primitive.
 
-        Deliberately does NOT know about case_analysis: this is the
-        Case-occurrence-window half of a two-query composition with
-        list_latest_case_analysis (its Case-analysis-snapshot counterpart,
-        see that method's docstring) -- a caller wanting "latest analysis
-        for Cases created in this window" composes both explicitly. Kept
-        this way so this method stays a general-purpose Case-identity
-        primitive a future Dashboard (or any other caller with a reason to
-        filter Cases by creation time, unrelated to case_analysis) can
-        reuse directly, rather than only being reachable through a
-        Reflector-shaped combined query.
-
-        Ordering is deterministic: created_at ascending, then case_id
-        ascending as the tiebreaker (unlike case_analysis.analyzed_at,
-        cases.created_at carries no UNIQUE constraint, so two different
-        Cases really can share the same created_at).
+        Ordering: created_at ascending, then case_id ascending as the
+        tiebreaker (cases.created_at carries no UNIQUE constraint, so two
+        Cases can share the same created_at).
         """
         query = "SELECT case_id FROM cases WHERE 1=1"
         params: list[Any] = []
@@ -1757,33 +1287,18 @@ class FeedbackStoreV2:
     ) -> list[sqlite3.Row]:
         """Every Case's most recent case_analysis row (by analyzed_at), one
         row per case_id -- the batch counterpart to get_latest_case_analysis
-        (which serves a single case_id). Same "latest" semantics as that
-        method: UNIQUE(case_id, analyzed_at) makes MAX(analyzed_at) per
-        case_id unambiguous, so a Case's historical (superseded) analysis
-        rows can never be double-counted alongside its current one here
-        either.
+        (which serves a single case_id). UNIQUE(case_id, analyzed_at) makes
+        MAX(analyzed_at) per case_id unambiguous.
 
         case_ids=None (the default) returns the latest row for every Case
-        that has EVER been analyzed (i.e. every distinct case_id present in
-        case_analysis) -- a Case that has never been analyzed contributes no
-        row, exactly like get_latest_case_analysis(case_id) returns None for
-        it. case_ids=<empty collection> is explicit input, not "no filter":
-        it deterministically returns [] without ever querying the database
-        -- an empty collection must never be silently reinterpreted as
-        "case_ids was omitted". This mirrors the None-vs-explicitly-empty
-        distinction tools.retrieval_runtime.persist_turn_and_retrieval
-        already establishes for its own candidate_case_ids parameter (see
-        that function's docstring): omitted and explicitly-empty are two
-        different, both meaningful, inputs.
+        that has EVER been analyzed. case_ids=<empty collection> is
+        explicit input, not "no filter": it deterministically returns []
+        without ever querying the database -- an empty collection must
+        never be silently reinterpreted as "case_ids was omitted".
 
-        Deliberately does NOT know about cases.created_at, any notion of an
-        analysis "window", or Reflector -- this is a general-purpose
-        "latest snapshot per Case" primitive a future Dashboard can also
-        call directly (e.g. "latest analysis for these specific case_ids",
-        no time-window concept involved at all). A caller that also wants
-        to scope by Case creation time composes this with
-        list_case_ids_created_in_window (its Case-identity/creation-time
-        counterpart) rather than this method absorbing that filter itself.
+        Deliberately does NOT know about cases.created_at or any notion of
+        an analysis "window" -- a caller that wants to scope by Case
+        creation time composes this with list_case_ids_created_in_window.
 
         Ordering is deterministic: case_id ascending.
         """
@@ -2147,80 +1662,57 @@ class FeedbackStoreV2:
     ) -> bool:
         """Atomically insert every new Proposal and every Observation for
         one Reflection Run, in a SINGLE transaction -- either every row is
-        written, or none is (Phase 5 Slice 6A task instruction, section 4:
-        never a Proposal with no Observation, never a half-written
-        Observation batch).
+        written, or none is (never a Proposal with no Observation, never a
+        half-written Observation batch).
 
         Unlike create_improvement_proposal()/create_proposal_observation()
-        (each its own implicit commit-per-call transaction via
-        self._connect()'s `with` context), this method opens one explicit
-        BEGIN IMMEDIATE / COMMIT / ROLLBACK transaction on a dedicated
-        connection, mirroring the exact choreography this module already
-        uses for _upgrade_retrieval_runs_execution_statuses() / _upgrade_
-        case_analysis_taxonomy() (see those methods' own docstrings) --
-        the only other place in this module more than one write needs to
-        succeed or fail together. `PRAGMA foreign_keys=ON` is set
+        (each its own implicit commit-per-call transaction), this method
+        opens one explicit BEGIN IMMEDIATE / COMMIT / ROLLBACK transaction
+        on a dedicated connection. `PRAGMA foreign_keys=ON` is set
         explicitly on this fresh connection (SQLite defaults a brand-new
         connection to foreign_keys=OFF) so the FK-violation-based fail-
         closed behavior below actually fires.
 
         `new_proposals` items need: proposal_id, improvement_target,
-        title, created_at (review_status is never caller-supplied here
-        either -- forced to 'pending', matching create_improvement_
-        proposal()'s own "only one legal initial value" convention).
-        `observations` items need: observation_id, proposal_id, trend,
-        pattern_summary, possible_cause, recommended_improvement,
-        expected_benefit, limitations, supporting_case_ids_json,
-        supporting_case_count, confidence, observed_at -- the exact same
-        shape create_proposal_observation() already takes, minus
-        reflection_run_id (this method's own `reflection_run_id`
-        parameter is used for every row, never read from the mapping, so
-        a caller cannot accidentally attach one Observation to a
-        different Run than the rest of this same call's batch).
+        title, created_at (review_status is forced to 'pending', never
+        caller-supplied). `observations` items need: observation_id,
+        proposal_id, trend, pattern_summary, possible_cause,
+        recommended_improvement, expected_benefit, limitations,
+        supporting_case_ids_json, supporting_case_count, confidence,
+        observed_at -- this method's own `reflection_run_id` parameter is
+        used for every row, never read from the mapping, so a caller
+        cannot accidentally attach one Observation to a different Run
+        than the rest of this same call's batch.
 
         Plain Mapping[str, Any] rows, not tools.reflector_proposals.
         ImprovementProposal/ProposalObservation instances -- this module
         must not import that module (it would be a circular import: that
-        module already imports taxonomy constants FROM this one). A
-        caller with ImprovementProposal/ProposalObservation objects (e.g.
-        a future persist_reflection_result() glue function) is expected
-        to project each into this plain-mapping shape itself, exactly how
-        tools.run_case_enrichment already projects a CaseEnrichmentResult
-        into create_case_analysis()'s own plain keyword arguments.
+        module already imports taxonomy constants FROM this one).
 
         Re-validates every primitive value in Python before opening the
-        transaction (fail closed, before touching the DB at all) --
-        mirrors create_improvement_proposal()/create_proposal_observation()'s
-        own "never depends on the caller's dataclass __post_init__ having
-        already run" convention, since this is a public storage boundary
-        too. Cross-field rules (trend requires supporting cases except
-        'no_longer_observed', etc.) are NOT re-checked here, matching
-        create_proposal_observation()'s own reasoning: single-column
+        transaction (fail closed, before touching the DB at all).
+        Cross-field rules (trend requires supporting cases except
+        'no_longer_observed', etc.) are NOT re-checked here: single-column
         checks are this layer's job, cross-field consistency is the
         dataclass layer's.
 
         Insertion order within the transaction is always every
         new_proposals row, THEN every observations row -- an Observation
         founding a brand-new Proposal (action=create_new) would otherwise
-        violate proposal_observations' own
-        FOREIGN KEY (proposal_id) REFERENCES improvement_proposals
-        (proposal_id) constraint, since that Proposal row would not exist
-        yet.
+        violate proposal_observations' own FOREIGN KEY (proposal_id)
+        REFERENCES improvement_proposals (proposal_id) constraint, since
+        that Proposal row would not exist yet.
 
-        The match_existing / create_new guardrails Phase 5 Slice 6A task
-        instruction sections 6-7 ask for are NOT re-implemented as
-        separate Python checks here -- they fall directly out of the
-        schema's own constraints, which this method never bypasses:
+        The match_existing / create_new guardrails fall directly out of
+        the schema's own constraints, never re-implemented as separate
+        Python checks here:
           * an Observation whose proposal_id names neither a Proposal in
             `new_proposals` (this call) nor an already-existing
             improvement_proposals row violates the FOREIGN KEY constraint
-            above -- exactly "match_existing referencing a Proposal that
-            does not exist" (Phase 5 Slice 6A task instruction, section 6:
-            "如果不存在：fail closed").
+            above.
           * a duplicate proposal_id in `new_proposals` (or one that
             collides with an existing row) violates improvement_proposals'
-            own PRIMARY KEY -- exactly "duplicate create_new Proposal ID"
-            (section 7: "如果 duplicate proposal_id：fail closed / rollback").
+            own PRIMARY KEY.
         Both surface as sqlite3.IntegrityError, caught below, which rolls
         back the WHOLE transaction and returns False -- never a partial
         write, never a silently-ignored duplicate.
@@ -2230,8 +1722,7 @@ class FeedbackStoreV2:
         pattern_summary/blank recommended_improvement/invalid confidence/
         invalid supporting_case_count on any observations row; or any
         sqlite3.IntegrityError raised while executing the transaction
-        (already-rolled-back by this method itself in every such case --
-        the caller never needs to issue its own ROLLBACK).
+        (already-rolled-back by this method itself in every such case).
         """
         for proposal in new_proposals:
             if proposal["improvement_target"] not in _IMPROVEMENT_TARGET_VALUE_SET:

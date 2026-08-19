@@ -12,17 +12,23 @@ from tools.universal_feedback import safe_feedback_text
 DEFAULT_PATH = Path("/sandbox/.hermes/data/support_feedback.db")
 MAX_SUGGESTION_TEXT_LENGTH = 1000
 _REASON_CODE_PLACEHOLDERS = ",".join("?" for _ in REASON_CODES)
+
+# Only the Telegram feedback-interaction/authorization columns this store
+# actually uses: run_id/chat_id/telegram_user_id/feedback_message_id bind and
+# authorize a callback against the row that sent it; turn_key links the row
+# to its v2 turns.turn_id for tools.feedback_mirror; submitted_at/helpful/
+# resolved/reason_code/suggestion_text are the collected interaction state
+# itself (resolved is the legacy /feedback_test flow's counterpart to
+# helpful); feedback_send_status records whether the prompt message itself
+# was actually delivered. Turn/Retrieval/Case Intelligence evidence
+# (question_text, answer_text, ...) lives once, in v2 turns -- it is never
+# duplicated here.
 BASE_COLUMNS = {
     "run_id": "TEXT PRIMARY KEY", "chat_id": "TEXT NOT NULL", "resolved": "INTEGER",
     "created_at": "TEXT NOT NULL", "submitted_at": "TEXT",
-    "turn_key": "TEXT", "telegram_user_id": "TEXT", "session_id": "TEXT",
-    "user_message_id": "TEXT", "assistant_message_id": "TEXT", "feedback_message_id": "TEXT",
-    "question_text": "TEXT", "answer_text": "TEXT", "helpful": "INTEGER",
-    "reason_code": "TEXT", "suggestion_text": "TEXT", "feedback_ui_mode": "TEXT",
-    "feedback_send_status": "TEXT", "feedback_trigger_reason": "TEXT",
-    "foundry_iq_attempted": "INTEGER", "foundry_iq_ok": "INTEGER",
-    "foundry_iq_metadata_json": "TEXT", "feedback_policy_version": "TEXT",
-    "feedback_schema_version": "TEXT",
+    "turn_key": "TEXT", "telegram_user_id": "TEXT", "feedback_message_id": "TEXT",
+    "helpful": "INTEGER", "reason_code": "TEXT", "suggestion_text": "TEXT",
+    "feedback_send_status": "TEXT",
 }
 
 
@@ -45,13 +51,19 @@ class FeedbackStore:
             self._migrate_schema()
 
     def _migrate_schema(self) -> None:
-        """Idempotently migrate feedback_runs without converting resolved."""
+        """Idempotently create feedback_runs in its current shape.
+
+        A POC whose data can always be discarded and reinitialized does
+        not need incremental ALTER TABLE machinery for a database still at
+        an older column set -- CREATE TABLE IF NOT EXISTS is a no-op
+        against an existing table regardless of its exact column set, so a
+        stale dev DB simply keeps whatever extra columns it already has
+        (harmless and ignored) rather than being reconciled column-by-
+        column at every startup.
+        """
+        columns_sql = ", ".join(f"{name} {spec}" for name, spec in BASE_COLUMNS.items())
         with self._connect() as db:
-            db.execute("CREATE TABLE IF NOT EXISTS feedback_runs (run_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, resolved INTEGER, created_at TEXT NOT NULL, submitted_at TEXT)")
-            existing = {row[1] for row in db.execute("PRAGMA table_info(feedback_runs)")}
-            for name, spec in BASE_COLUMNS.items():
-                if name not in existing and name != "run_id":
-                    db.execute(f"ALTER TABLE feedback_runs ADD COLUMN {name} {spec}")
+            db.execute(f"CREATE TABLE IF NOT EXISTS feedback_runs ({columns_sql})")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_runs_turn_key ON feedback_runs(turn_key) WHERE turn_key IS NOT NULL")
 
     def _connect(self):
@@ -60,14 +72,16 @@ class FeedbackStore:
         return db
 
     def create_run(self, run_id: str, chat_id: str, **fields: Any) -> bool:
+        """Insert a new row, keyed by run_id, picking up only the fields
+        this store actually persists (see BASE_COLUMNS) -- an unrecognized
+        keyword in **fields (e.g. a caller's own Telegram-threading
+        metadata) is silently ignored rather than rejected, so callers can
+        pass one shared metadata dict to both this and other consumers."""
         names = ["run_id", "chat_id", "created_at"]
         values = [str(run_id), str(chat_id), _now()]
         for name in BASE_COLUMNS:
             if name not in names and name in fields:
-                value = fields[name]
-                if name in {"question_text", "answer_text"}:
-                    value = safe_feedback_text(value)
-                names.append(name); values.append(value)
+                names.append(name); values.append(fields[name])
         placeholders = ",".join("?" for _ in names)
         with self._connect() as db:
             try:
@@ -79,10 +93,6 @@ class FeedbackStore:
     def get(self, run_id: str):
         with self._connect() as db:
             return db.execute("SELECT * FROM feedback_runs WHERE run_id = ?", (run_id,)).fetchone()
-
-    def get_by_turn_key(self, key: str):
-        with self._connect() as db:
-            return db.execute("SELECT * FROM feedback_runs WHERE turn_key = ?", (key,)).fetchone()
 
     def get_by_feedback_message_id(self, chat_id: str, feedback_message_id: str):
         """Look up the row for a (chat_id, feedback_message_id) pair.
@@ -103,9 +113,9 @@ class FeedbackStore:
             return None
         return rows[0]
 
-    def mark_send(self, run_id: str, *, status: str, feedback_message_id: str | None = None, assistant_message_id: str | None = None, ui_mode: str | None = None) -> bool:
+    def mark_send(self, run_id: str, *, status: str, feedback_message_id: str | None = None) -> bool:
         with self._connect() as db:
-            cur = db.execute("UPDATE feedback_runs SET feedback_send_status=?, feedback_message_id=?, assistant_message_id=?, feedback_ui_mode=? WHERE run_id=?", (status, feedback_message_id, assistant_message_id, ui_mode, run_id))
+            cur = db.execute("UPDATE feedback_runs SET feedback_send_status=?, feedback_message_id=? WHERE run_id=?", (status, feedback_message_id, run_id))
             return cur.rowcount == 1
 
     def submit_helpful(self, run_id: str, helpful: bool) -> bool:

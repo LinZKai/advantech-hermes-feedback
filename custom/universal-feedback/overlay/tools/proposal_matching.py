@@ -1,5 +1,4 @@
-"""Phase 5 Slice 3: the Existing-Proposal candidate + match/new resolution
-contract.
+"""The Existing-Proposal candidate + match/new resolution contract.
 
     FeedbackStoreV2
      |
@@ -25,25 +24,17 @@ contract.
     validate_proposal_resolution()  (this module -- deterministic,
                                        candidate-bound, no LLM)
 
-Slice 3 scope only: the minimal projection a future Reflector step needs to
-decide "is this finding an existing Proposal re-observed, or a genuinely
-new one", and the deterministic guardrails around that decision. No LLM
-call, no prompt, no semantic/fuzzy/embedding matching (the actual identity
-DECISION is a future Reflector reasoning step's job -- see "Proposal
-Identity Rule" below), no ReflectionResult persistence, no runner, no
-scheduler. Storage queries stay in tools.feedback_store_v2 -- this module
-issues no raw SQL of its own, matching tools.case_enrichment's and
-tools.case_reflection_input's own "glue, not storage" layering.
-
-No new storage API was needed for this slice: tools.feedback_store_v2.
-list_improvement_proposals(review_status=...) and
-list_latest_proposal_observations(proposal_ids=...) (both already added in
-Slice 2) are exactly the batch primitives this module's builder composes --
-confirmed by read-only audit before writing any code here.
+The minimal projection a future Reflector step needs to decide "is this
+finding an existing Proposal re-observed, or a genuinely new one", and the
+deterministic guardrails around that decision. No LLM call, no prompt, no
+semantic/fuzzy/embedding matching (the actual identity DECISION is a
+future Reflector reasoning step's job -- see "Proposal Identity Rule"
+below), no ReflectionResult persistence, no runner, no scheduler. Storage
+queries stay in tools.feedback_store_v2 -- this module issues no raw SQL
+of its own.
 
 ---------------------------------------------------------------------------
-Proposal Identity Rule (documented here, NOT implemented -- Phase 5 task
-instruction, section 6)
+Proposal Identity Rule (documented here, NOT implemented)
 ---------------------------------------------------------------------------
 
 Proposal identity is NOT title string equality, and NOT bare topic
@@ -84,10 +75,11 @@ and only a target-consistent one."
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
-from typing import Any, Collection
+from typing import Collection
 
+from tools._validation import is_valid_confidence as _is_valid_confidence
+from tools._validation import require_nonblank_str as _require_nonblank_str
 from tools.feedback_store_v2 import (
     FeedbackStoreV2,
     IMPROVEMENT_TARGET_VALUES,
@@ -107,38 +99,12 @@ _TRENDS_REQUIRING_SUPPORTING_CASES = frozenset(PROPOSAL_TREND_VALUES) - {"no_lon
 # (no column represents it), so -- unlike IMPROVEMENT_TARGET_VALUES/
 # REVIEW_STATUS_VALUES/PROPOSAL_TREND_VALUES, which back real CHECK
 # constraints and live in that module as the taxonomy authority -- this
-# taxonomy is local to this module. Mirrors tools.case_routing's own
-# locally-defined _CASE_ACTION_SET ({"existing", "new", "uncertain"}, a
-# structurally identical match/new-shaped decision for Case Routing) for
-# exactly the same reason: a decision taxonomy with no DB column of its
-# own belongs next to the code that makes the decision, not in the
-# storage-schema taxonomy authority.
+# taxonomy is local to this module: a decision taxonomy with no DB column
+# of its own belongs next to the code that makes the decision.
 PROPOSAL_RESOLUTION_ACTION_VALUES: tuple[str, ...] = ("match_existing", "create_new")
 _RESOLUTION_ACTION_VALUE_SET = frozenset(PROPOSAL_RESOLUTION_ACTION_VALUES)
 
 DEFAULT_CANDIDATE_REVIEW_STATUS = "pending"
-
-
-def _is_valid_confidence(value: Any) -> bool:
-    """True only for a real, finite number in [0.0, 1.0].
-
-    Deliberately its own local copy -- see tools.reflector_proposals.
-    _is_valid_confidence's docstring for why every module in this domain
-    keeps its own copy rather than importing a sibling module's private
-    helper.
-    """
-    if isinstance(value, bool):
-        return False
-    if not isinstance(value, (int, float)):
-        return False
-    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-        return False
-    return 0.0 <= value <= 1.0
-
-
-def _require_nonblank_str(value: Any, field_name: str) -> None:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field_name} must be a non-blank string, got {value!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +122,7 @@ class ProposalCandidate:
     supporting_case_ids (only the COUNT) -- carrying more than this
     minimal projection would let a future matching step accidentally key
     off details (e.g. exact historical wording) it should not need for an
-    identity decision, and bloats context for no benefit (Phase 5 task
-    instruction, section 11).
+    identity decision, and bloats context for no benefit.
 
     review_status is included as explicit context even though every
     Candidate returned by build_proposal_candidates()'s current default
@@ -235,20 +200,15 @@ class ProposalCandidateBuildError(RuntimeError):
     explicit cases_missing_analysis gap field, no exception) -- the two
     situations are not analogous. A Case naturally exists before its own
     Case Enrichment completes; that is the NORMAL, EXPECTED, common
-    pipeline order Slice 1 was built to tolerate. A pending Improvement
-    Proposal with zero Observations is different: tools.reflector_
-    proposals.ReflectionResult.__post_init__ already structurally
-    guarantees every new_proposals entry has a founding
-    proposal_observations entry at the moment a Reflection Run's result is
-    constructed (see that class's docstring) -- so encountering a
-    Proposal with no Observation here means something has already gone
-    wrong upstream (a partial/crashed write, since this slice has not yet
-    built an atomic ReflectionResult-persistence helper -- see the Slice 2
-    report's "Recommended Next Step" -- or direct DB tampering), not a
-    normal transient state this function should quietly tolerate. Failing
-    loudly is the correct "fail closed" response for a genuine invariant
-    violation, per the Phase 5 task instruction's own framing ("這在正常
-    lifecycle 理論上不應發生").
+    pipeline order. A pending Improvement Proposal with zero Observations
+    is different: tools.reflector_proposals.ReflectionResult.__post_init__
+    already structurally guarantees every new_proposals entry has a
+    founding proposal_observations entry at the moment a Reflection Run's
+    result is constructed -- so encountering a Proposal with no
+    Observation here means something has already gone wrong upstream (a
+    partial/crashed write, or direct DB tampering), not a normal transient
+    state this function should quietly tolerate. Failing loudly is the
+    correct "fail closed" response for a genuine invariant violation.
     """
 
 
@@ -277,26 +237,19 @@ def build_proposal_candidates(
         other batch read in this domain: tools.feedback_store_v2.
         list_latest_case_analysis / list_latest_proposal_observations)
 
-    review_status defaults to 'pending' (Phase 5 task instruction, section
-    3: pending is the set most in need of avoiding a duplicate-Proposal
-    re-creation, since it is the only status not yet resolved by a human).
-    Exposed as a keyword parameter, never hard-coded inside this function
-    body, so a future caller with a genuine reason to widen the candidate
-    scope is not blocked by this contract -- see ProposalCandidate's own
-    docstring for the matching design choice at the dataclass level.
+    review_status defaults to 'pending' (the set most in need of avoiding
+    a duplicate-Proposal re-creation, since it is the only status not yet
+    resolved by a human). Exposed as a keyword parameter, never hard-coded
+    inside this function body, so a future caller with a genuine reason to
+    widen the candidate scope is not blocked by this contract.
 
     Uses only tools.feedback_store_v2.FeedbackStoreV2 query methods -- no
-    raw SQL here (confirmed both already exist and need no change: read-
-    only audit before writing this function found list_improvement_
-    proposals(review_status=...) and list_latest_proposal_observations
-    (proposal_ids=...), both already added in Slice 2, are exactly the
-    batch primitives this function needs).
+    raw SQL here.
 
     Raises ProposalCandidateBuildError (never silently drops the Proposal,
     never silently builds a title-only/placeholder Candidate) if any
     Proposal in scope has no latest Observation at all -- see that
-    exception's own docstring for why this differs from Slice 1's
-    explicit-gap-field convention.
+    exception's own docstring for why.
     """
     proposal_rows = store.list_improvement_proposals(review_status=review_status)
     if not proposal_rows:
@@ -349,19 +302,14 @@ class ProposalResolution:
     proposal_id=None -- a finding cannot simultaneously claim to be new
     and reference an existing Proposal id.
 
-    improvement_target is required for BOTH actions, not only to support
-    validate_proposal_resolution()'s target-consistency check (Phase 5
-    task instruction, section 9 -- the maintainer's stated preference is
-    to enforce this) but because it is substantively needed either way: a
-    create_new finding needs it to know what kind of Proposal it will
-    become, and a match_existing finding needs it to state what target
-    the finding itself belongs to, independent of whatever Proposal it
-    may or may not turn out to match. Deliberately minimal beyond that --
-    no title/pattern_summary/trend/etc. here; this slice models the
-    match/new DECISION only, not the finding's full content (Phase 5 task
-    instruction, section 7's explicit two-field ask, extended by exactly
-    one field for the reason above -- see this module's report for the
-    justification).
+    improvement_target is required for BOTH actions: a create_new finding
+    needs it to know what kind of Proposal it will become, and a
+    match_existing finding needs it to state what target the finding
+    itself belongs to, independent of whatever Proposal it may or may not
+    turn out to match -- this also feeds validate_proposal_resolution()'s
+    target-consistency check. Deliberately minimal beyond that -- no
+    title/pattern_summary/trend/etc. here; this module models the
+    match/new DECISION only, not the finding's full content.
     """
 
     action: str
@@ -399,24 +347,17 @@ def validate_proposal_resolution(
     action='create_new': always valid regardless of `candidates` (even an
     empty candidate set) -- ProposalResolution.__post_init__ already
     guarantees proposal_id is None for this action; re-checked here too
-    (defense in depth, matching tools.case_routing.validate_case_routing's
-    own "re-check case_action/routing_version shape invariants, in case
-    result was constructed by a caller other than the usual parser"
-    convention) rather than trusting the dataclass invariant
+    (defense in depth) rather than trusting the dataclass invariant
     unconditionally.
 
     action='match_existing': valid ONLY if proposal_id names one of the
     OFFERED candidates -- an unknown/hallucinated proposal_id is
-    unconditionally rejected (False), never "find the closest candidate"
-    (mirrors tools.case_routing.validate_case_routing's own "Never 'find
-    the closest case' for an unrecognized id" rule for the structurally
-    identical Case Routing problem). An empty `candidates` collection
-    therefore makes every match_existing resolution False by construction
-    -- there is nothing to match against.
+    unconditionally rejected (False), never "find the closest candidate".
+    An empty `candidates` collection therefore makes every match_existing
+    resolution False by construction -- there is nothing to match against.
 
-    improvement_target consistency (Phase 5 task instruction, section 9,
-    maintainer's stated preference: YES): when a match IS found, this
-    function additionally requires `resolution.improvement_target ==
+    improvement_target consistency: when a match IS found, this function
+    additionally requires `resolution.improvement_target ==
     matched_candidate.improvement_target` -- an agent_behavior finding may
     never resolve to a knowledge Candidate, even if the referenced
     proposal_id is real. This mismatch also returns False, not a separate

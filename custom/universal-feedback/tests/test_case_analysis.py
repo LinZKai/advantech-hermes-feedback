@@ -4,9 +4,8 @@ the needs-analysis lifecycle contract.
 
 Deliberately a separate file from test_feedback_store_v2.py, matching the
 one-file-per-concern convention already used for test_case_routing.py /
-test_case_assignment.py / test_migration_003.py: this is a substantial,
-independently reviewable slice (Phase 4.5 Stage A), not an extension of the
-existing v2-schema test surface.
+test_case_assignment.py: this is a substantial, independently reviewable
+slice, not an extension of the existing v2-schema test surface.
 
 Stage A scope only: schema, storage queries, and their tests. No LLM call,
 no enrichment service, no runner, no scheduler, and no Human Override logic
@@ -38,8 +37,6 @@ from tools.feedback_store_v2 import (  # noqa: E402
     FeedbackStoreV2,
     RetrievalRunInput,
 )
-
-_004_SQL_PATH = _OVERLAY_ROOT / "migrations" / "004_case_analysis.sql"
 
 
 # ---------------------------------------------------------------------------
@@ -314,11 +311,11 @@ class SchemaTests(_StoreTestCase):
 
     def test_existing_pre_004_database_gets_case_analysis_added(self):
         """An existing v2 database created before case_analysis existed
-        (built directly from 002_feedback_schema_v2.sql's own file content,
-        matching test_migration_003.py's established technique for
-        constructing a genuinely "old" database) must gain case_analysis
-        (and its index) the next time FeedbackStoreV2 opens it -- without
-        losing any of its existing tables/data."""
+        (built directly from 002_feedback_schema_v2.sql's own frozen file
+        content) must gain case_analysis (and its index) the next time
+        FeedbackStoreV2 opens it -- without losing any of its existing
+        tables/data. Purely additive (CREATE TABLE IF NOT EXISTS); no
+        rebuild involved."""
         old_db_path = Path(self._tmpdir.name) / "pre_004.db"
         sql_text = _002_SQL_PATH.read_text(encoding="utf-8")
         conn = sqlite3.connect(old_db_path)
@@ -349,155 +346,6 @@ class SchemaTests(_StoreTestCase):
         del upgraded
         gc.collect()
 
-
-class Migration004To005Tests(_StoreTestCase):
-    """Stage B.5 Schema Alignment: an existing database already at the 004
-    shape (with real case_analysis rows using the OLD 6-value diagnosis
-    taxonomy and no issue_type/issue_type_confidence columns) must upgrade
-    cleanly to the new shape the next time FeedbackStoreV2 opens it."""
-
-    def _seed_004_shape_db(self, db_path):
-        sql_002 = _002_SQL_PATH.read_text(encoding="utf-8")
-        sql_004 = _004_SQL_PATH.read_text(encoding="utf-8")
-        conn = sqlite3.connect(db_path)
-        try:
-            conn.executescript(sql_002)
-            conn.executescript(sql_004)
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute(
-                "INSERT INTO sessions (session_id, platform, platform_chat_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                ("sess-old", "telegram", "chat-old", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
-            )
-            conn.execute(
-                "INSERT INTO cases (case_id, session_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                ("case-old", "sess-old", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
-            )
-            # unclear_or_other -- has a real diagnosis_confidence.
-            conn.execute(
-                "INSERT INTO case_analysis (analysis_id, case_id, case_title, issue_summary, diagnosis, diagnosis_confidence, analysis_version, analyzed_at, source_evidence_watermark) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("a-unclear", "case-old", "old title", "old summary", "unclear_or_other", 0.4, "v0", "2026-01-01T00:00:01+00:00", "2026-01-01T00:00:00+00:00"),
-            )
-            # workflow_tool_issue -- diagnosis_confidence left NULL (the old
-            # API accepted this).
-            conn.execute(
-                "INSERT INTO case_analysis (analysis_id, case_id, diagnosis, analysis_version, analyzed_at, source_evidence_watermark) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                ("a-workflow", "case-old", "workflow_tool_issue", "v0", "2026-01-02T00:00:00+00:00", "2026-01-02T00:00:00+00:00"),
-            )
-            # A row already using a taxonomy value that survives unchanged.
-            conn.execute(
-                "INSERT INTO case_analysis (analysis_id, case_id, diagnosis, diagnosis_confidence, analysis_version, analyzed_at, source_evidence_watermark) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("a-unchanged", "case-old", "knowledge_gap", 0.9, "v0", "2026-01-03T00:00:00+00:00", "2026-01-03T00:00:00+00:00"),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    def test_unclear_or_other_renamed_to_other_or_unclear(self):
-        db_path = Path(self._tmpdir.name) / "pre_005.db"
-        self._seed_004_shape_db(db_path)
-        upgraded = FeedbackStoreV2(db_path)
-        try:
-            with sqlite3.connect(db_path) as raw:
-                raw.row_factory = sqlite3.Row
-                row = raw.execute("SELECT * FROM case_analysis WHERE analysis_id=?", ("a-unclear",)).fetchone()
-            self.assertEqual(row["diagnosis"], "other_or_unclear")
-            self.assertEqual(row["diagnosis_confidence"], 0.4)  # preserved, was not NULL
-        finally:
-            del upgraded
-            gc.collect()
-
-    def test_workflow_tool_issue_downgraded_to_other_or_unclear(self):
-        db_path = Path(self._tmpdir.name) / "pre_005.db"
-        self._seed_004_shape_db(db_path)
-        upgraded = FeedbackStoreV2(db_path)
-        try:
-            with sqlite3.connect(db_path) as raw:
-                raw.row_factory = sqlite3.Row
-                row = raw.execute("SELECT * FROM case_analysis WHERE analysis_id=?", ("a-workflow",)).fetchone()
-            self.assertEqual(row["diagnosis"], "other_or_unclear")
-            self.assertEqual(row["diagnosis_confidence"], 0.0)  # fallback, was NULL
-        finally:
-            del upgraded
-            gc.collect()
-
-    def test_legacy_rows_get_issue_type_fallback(self):
-        db_path = Path(self._tmpdir.name) / "pre_005.db"
-        self._seed_004_shape_db(db_path)
-        upgraded = FeedbackStoreV2(db_path)
-        try:
-            with sqlite3.connect(db_path) as raw:
-                raw.row_factory = sqlite3.Row
-                rows = raw.execute("SELECT * FROM case_analysis").fetchall()
-            self.assertEqual(len(rows), 3)
-            for row in rows:
-                self.assertEqual(row["issue_type"], "other_or_unclear")
-                self.assertEqual(row["issue_type_confidence"], 0.0)
-        finally:
-            del upgraded
-            gc.collect()
-
-    def test_unaffected_diagnosis_value_and_other_columns_preserved(self):
-        db_path = Path(self._tmpdir.name) / "pre_005.db"
-        self._seed_004_shape_db(db_path)
-        upgraded = FeedbackStoreV2(db_path)
-        try:
-            with sqlite3.connect(db_path) as raw:
-                raw.row_factory = sqlite3.Row
-                row = raw.execute("SELECT * FROM case_analysis WHERE analysis_id=?", ("a-unchanged",)).fetchone()
-            self.assertEqual(row["diagnosis"], "knowledge_gap")
-            self.assertEqual(row["diagnosis_confidence"], 0.9)
-
-            unclear_row = raw.execute("SELECT * FROM case_analysis WHERE analysis_id=?", ("a-unclear",)).fetchone()
-            self.assertEqual(unclear_row["case_title"], "old title")
-            self.assertEqual(unclear_row["issue_summary"], "old summary")
-            self.assertEqual(unclear_row["analysis_version"], "v0")
-            self.assertEqual(unclear_row["analyzed_at"], "2026-01-01T00:00:01+00:00")
-            self.assertEqual(unclear_row["source_evidence_watermark"], "2026-01-01T00:00:00+00:00")
-        finally:
-            del upgraded
-            gc.collect()
-
-    def test_new_check_constraints_active_after_upgrade(self):
-        # Confirms the rebuilt table really has the new CHECK constraints
-        # live, not just the right column set -- a new INSERT using a
-        # dropped legacy diagnosis value must now be rejected.
-        db_path = Path(self._tmpdir.name) / "pre_005.db"
-        self._seed_004_shape_db(db_path)
-        upgraded = FeedbackStoreV2(db_path)
-        try:
-            ok = upgraded.create_case_analysis(
-                "a-new", "case-old",
-                case_title=None, issue_summary=None,
-                issue_type="product_usage_or_application", issue_type_confidence=0.5,
-                diagnosis="workflow_tool_issue", diagnosis_confidence=0.5,
-                product_model=None, product_source=None, product_confidence=None,
-                evidence_json=None, analysis_version="v1",
-                analyzed_at="2026-01-04T00:00:00+00:00",
-                source_evidence_watermark="2026-01-04T00:00:00+00:00",
-            )
-            self.assertFalse(ok)
-        finally:
-            del upgraded
-            gc.collect()
-
-    def test_upgrade_is_idempotent(self):
-        db_path = Path(self._tmpdir.name) / "pre_005.db"
-        self._seed_004_shape_db(db_path)
-        first = FeedbackStoreV2(db_path)
-        del first
-        gc.collect()
-        second = FeedbackStoreV2(db_path)
-        try:
-            with sqlite3.connect(db_path) as raw:
-                raw.row_factory = sqlite3.Row
-                count = raw.execute("SELECT COUNT(*) AS n FROM case_analysis").fetchone()["n"]
-            self.assertEqual(count, 3)  # not duplicated by re-running the upgrade
-        finally:
-            del second
-            gc.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -930,15 +778,6 @@ class AnalysisPersistenceTests(_StoreTestCase):
         self.assertEqual(row["product_source"], "explicit_user_text")
         self.assertEqual(row["product_confidence"], 0.95)
         self.assertEqual(json.loads(row["evidence_json"]), json.loads(evidence))
-
-    def test_does_not_touch_cases_title_or_product_model(self):
-        # create_case_analysis must never write to cases.title/product_model
-        # -- that is explicitly deferred (Human Override policy, later stage).
-        self._seed_session_and_case()
-        self._create_analysis("case-1", analyzed_at="2026-01-01T00:00:00+00:00", source_evidence_watermark="2026-01-01T00:00:00+00:00")
-        case = self.store.get_case("case-1")
-        self.assertIsNone(case["title"])
-        self.assertIsNone(case["product_model"])
 
 
 # ---------------------------------------------------------------------------

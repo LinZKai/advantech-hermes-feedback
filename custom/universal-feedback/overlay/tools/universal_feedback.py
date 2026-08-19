@@ -83,27 +83,3 @@ def foundry_marker(tool_name: Any, arguments: Any) -> bool:
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
     return isinstance(args, dict) and FOUNDARY_SCRIPT in str(args.get("command") or "")
-
-
-def safe_foundry_metadata(raw: Any) -> dict:
-    """Keep only non-sensitive retrieval summary fields."""
-    if not isinstance(raw, Mapping):
-        return {}
-    out = {}
-    for key in ("ok", "exit_code", "model_name", "elapsed_ms"):
-        if key in raw and isinstance(raw[key], (bool, int, float, str, type(None))):
-            out[key] = raw[key]
-    for key in ("reference_sources", "references", "activity_types", "activity"):
-        value = raw.get(key)
-        if isinstance(value, list):
-            items = []
-            for item in value:
-                if isinstance(item, str):
-                    items.append(item[:256])
-                elif isinstance(item, Mapping):
-                    name = item.get("source") or item.get("name") or item.get("type")
-                    if name is not None:
-                        items.append(str(name)[:256])
-            if items:
-                out[key] = items[:50]
-    return out

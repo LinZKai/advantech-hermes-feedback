@@ -507,14 +507,6 @@ class PersistCaseTests(_StoreTestCase):
         self.assertNotEqual(rows_after[0]["analysis_id"], rows_after[1]["analysis_id"])
         self.assertNotEqual(rows_after[0]["analyzed_at"], rows_after[1]["analyzed_at"])
 
-    def test_cases_title_and_product_model_not_updated_by_persistence(self):
-        self._seed_session_and_case()
-        self._add_turn("case-1", "turn-1")
-        run(self.store, analyzer=_fake_llm_analyzer, persist=True)
-        case_row = self.store.get_case("case-1")
-        self.assertIsNone(case_row["title"])
-        self.assertIsNone(case_row["product_model"])
-
 
 # ---------------------------------------------------------------------------
 # 4. Watermark lifecycle (Stage D2's core value)

@@ -1,4 +1,4 @@
-"""Phase 5 Slice 1: the Cross-case Reflector input contract.
+"""The Cross-case Reflector input contract.
 
     FeedbackStoreV2
      |
@@ -17,52 +17,45 @@
      v
     ReflectorInput
 
-Slice 1 scope only: assemble the deterministic input a future Reflector LLM
-call needs. No LLM call, no prompt, no ImprovementProposal, no persistence,
-no scheduler -- those are later slices. Storage queries stay in
-tools.feedback_store_v2 -- this module issues no raw SQL of its own,
-matching tools.case_enrichment's own "glue, not storage" layering (see that
-module's docstring).
+Assembles the deterministic input a future Reflector LLM call needs. No
+LLM call, no prompt, no ImprovementProposal, no persistence, no scheduler.
+Storage queries stay in tools.feedback_store_v2 -- this module issues no
+raw SQL of its own.
 
-Case identity is session-scoped (confirmed by a prior read-only audit):
-Case Routing never merges Cases across Sessions, and cases.created_at is
-set once, at Case creation, and never rewritten -- so it reliably means
-"this independent Case occurrence began at this time" (see
-tools.feedback_store_v2.FeedbackStoreV2.create_case /
-list_case_ids_created_in_window). This module's analysis window is always
-a cases.created_at range -- never cases.updated_at (that column is never
-actually updated by anything, see get_case_evidence_watermark's docstring)
-and never case_analysis.source_evidence_watermark (that field's
+Case identity is session-scoped: Case Routing never merges Cases across
+Sessions, and cases.created_at is set once, at Case creation, and never
+rewritten -- so it reliably means "this independent Case occurrence began
+at this time". This module's analysis window is always a cases.created_at
+range -- never cases.updated_at (that column is never actually updated by
+anything) and never case_analysis.source_evidence_watermark (that field's
 responsibility stays Case Enrichment staleness, not Case occurrence time).
 
 Cross-Case pattern detection itself (similarity, recurrence, proposals) is
 explicitly NOT this module's job -- this module only assembles the
 deterministic facts a future Reflector LLM step will reason over.
 
-Serialization boundary (Slice 1.1): ReflectorInput.by_product_model/
-by_issue_type/by_diagnosis are types.MappingProxyType, an intentionally
-immutable view -- NOT a JSON-ready shape. Standard library json.dumps()
-raises TypeError on a mappingproxy directly (it is not a dict subclass);
-a future serializer (a later slice, not built here) must convert each via
-dict(...) before calling json.dumps(). This module deliberately builds no
-such serializer -- see build_reflector_input's docstring.
+Serialization boundary: ReflectorInput.by_product_model/by_issue_type/
+by_diagnosis are types.MappingProxyType, an intentionally immutable view --
+NOT a JSON-ready shape. json.dumps() raises TypeError on a mappingproxy
+directly; a future serializer must convert each via dict(...) first. This
+module deliberately builds no such serializer.
 
-Eligibility (Slice 1.1): is_reflection_eligible() below is a deliberately
-separate, tiny, LLM-free function -- ReflectorInput is a pure evidence/data
-contract with no opinion on whether a Reflector run should actually
-proceed; "should we run Reflector now" is an orchestration POLICY decision
-(a future batch runner's job, not built here), so the threshold is a
-caller-supplied parameter, never a ReflectorInput field.
+Eligibility: is_reflection_eligible() below is a deliberately separate,
+tiny, LLM-free function -- ReflectorInput is a pure evidence/data contract
+with no opinion on whether a Reflector run should actually proceed;
+"should we run Reflector now" is an orchestration POLICY decision, so the
+threshold is a caller-supplied parameter, never a ReflectorInput field.
 """
 from __future__ import annotations
 
 import json
 import logging
-import math
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
+from tools._validation import is_valid_confidence as _is_valid_confidence
+from tools._validation import require_nonblank_str as _require_nonblank_str
 from tools.case_enrichment import CaseAnalysisEvidence
 from tools.feedback_store_v2 import (
     DIAGNOSIS_VALUES,
@@ -88,32 +81,6 @@ UNKNOWN_PRODUCT_MODEL_BUCKET = "__unknown__"
 _EVIDENCE_REQUIRED_KEYS = frozenset({"type", "turn_id", "fact"})
 
 
-def _is_valid_confidence(value: Any) -> bool:
-    """True only for a real, finite number in [0.0, 1.0].
-
-    Deliberately its own local copy rather than importing tools.
-    feedback_store_v2._is_valid_confidence or
-    tools.case_enrichment._is_valid_confidence -- neither module exports
-    it, and both of those modules already independently keep their own
-    copy of this exact check rather than reaching across a module
-    boundary at a private, leading-underscore helper (see each of their
-    own docstrings for this same reasoning). This module follows the same
-    established convention.
-    """
-    if isinstance(value, bool):
-        return False
-    if not isinstance(value, (int, float)):
-        return False
-    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-        return False
-    return 0.0 <= value <= 1.0
-
-
-def _require_nonblank_str(value: Any, field_name: str) -> None:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field_name} must be a non-blank string, got {value!r}")
-
-
 # ---------------------------------------------------------------------------
 # Case Intelligence record -- one Case's latest case_analysis, typed
 # ---------------------------------------------------------------------------
@@ -126,24 +93,16 @@ class CaseIntelligenceRecord:
     ReflectorInput public contract.
 
     Structurally re-validates every field against the same taxonomies/
-    ranges tools.feedback_store_v2.create_case_analysis() and
-    tools.case_enrichment.CaseEnrichmentResult already enforce at WRITE
-    time -- belt-and-suspenders, matching the established convention that
-    every boundary in this codebase defends itself rather than trusting an
-    upstream layer unconditionally (see create_case_analysis()'s own
-    docstring: "never depends on CaseEnrichmentResult.__post_init__ having
-    already run ... this is a public storage boundary that must defend
-    itself regardless of caller"). This is the read-side mirror of that
-    same principle.
+    ranges enforced at WRITE time (create_case_analysis() /
+    CaseEnrichmentResult) -- every boundary in this codebase defends
+    itself rather than trusting an upstream layer unconditionally.
 
     Unlike CaseEnrichmentResult (the write-time contract, which requires
-    at least one evidence entry -- see that class's docstring), `evidence`
-    here MAY be empty: case_analysis.evidence_json is a nullable TEXT
-    column with no non-empty constraint at the storage layer, so a row
-    written directly through FeedbackStoreV2.create_case_analysis()
-    (bypassing the analyzer, e.g. in a test) can legitimately have no
-    evidence recorded. Read-time reconstruction must not reject a row the
-    storage layer itself already accepted as valid.
+    at least one evidence entry), `evidence` here MAY be empty:
+    case_analysis.evidence_json is a nullable TEXT column with no
+    non-empty constraint at the storage layer, so a row written directly
+    through FeedbackStoreV2.create_case_analysis() (bypassing the
+    analyzer, e.g. in a test) can legitimately have no evidence recorded.
     """
 
     case_id: str
@@ -205,16 +164,12 @@ def _parse_evidence_json(evidence_json: str | None) -> tuple[CaseAnalysisEvidenc
     """Parse case_analysis.evidence_json into a tuple of CaseAnalysisEvidence,
     or None if it is present but malformed.
 
-    None (the column's own "no evidence recorded" state -- see
-    CaseIntelligenceRecord's docstring) maps to an empty tuple, never to a
-    parse failure -- a missing value is not the same as an invalid one.
-    Any other problem (invalid JSON, wrong root type, an item with the
-    wrong keys, or an item that fails CaseAnalysisEvidence's own
-    __post_init__) returns None so the caller can classify this Case's
-    latest analysis as unparseable rather than silently dropping or
-    guessing at its evidence -- mirrors tools.case_enrichment.
-    parse_case_enrichment_result's exact evidence-parsing shape (same
-    required-keys check, same "never raises" contract).
+    None (the column's own "no evidence recorded" state) maps to an empty
+    tuple, never to a parse failure -- a missing value is not the same as
+    an invalid one. Any other problem (invalid JSON, wrong root type, an
+    item with the wrong keys, or a __post_init__ rejection) returns None
+    so the caller can classify this Case's latest analysis as unparseable
+    rather than silently dropping or guessing at its evidence.
     """
     if evidence_json is None:
         return ()
@@ -242,9 +197,7 @@ def _build_case_intelligence_record(row: Any) -> CaseIntelligenceRecord | None:
     """Reconstruct one CaseIntelligenceRecord from one
     list_latest_case_analysis() row, or None if it fails to parse/validate.
 
-    Never raises -- fail closed, matching tools.case_enrichment.
-    build_case_enrichment_input's own "returns None, never raises" contract
-    for a single unbuildable unit. The caller (build_reflector_input) is
+    Never raises -- fail closed. The caller (build_reflector_input) is
     responsible for recording which case_id this was for, in
     ReflectorInput.cases_with_unparseable_analysis -- this function itself
     has no case_id-tracking responsibility beyond logging.
@@ -289,24 +242,18 @@ def _build_case_intelligence_record(row: Any) -> CaseIntelligenceRecord | None:
 class ReflectorInput:
     """One Reflector analysis window's full deterministic input.
 
-    `window_start`/`window_end` are the exact bounds passed to
-    build_reflector_input() (ISO-8601 strings, or None), carried through
-    unchanged for traceability -- window_start is INCLUSIVE, window_end is
-    EXCLUSIVE, matching FeedbackStoreV2.list_case_ids_created_in_window's
-    own [start, end) contract exactly (this module does not re-derive or
-    reinterpret that boundary rule, only repeats it).
+    `window_start`/`window_end` are carried through unchanged for
+    traceability -- window_start is INCLUSIVE, window_end is EXCLUSIVE,
+    matching FeedbackStoreV2.list_case_ids_created_in_window's own
+    [start, end) contract exactly.
 
     `cases` holds every window Case's CaseIntelligenceRecord that was
-    successfully reconstructed -- this is the actual Case Intelligence a
-    future Reflector LLM step reads, not just aggregate counts (Phase 5
-    task instruction: "不要只保留 aggregate counts").
+    successfully reconstructed -- the actual Case Intelligence a future
+    Reflector LLM step reads, not just aggregate counts.
 
     Two gap-tracking fields make missing/broken data structurally
-    impossible to miss (never silently dropped -- see
-    build_reflector_input's docstring for the full reasoning). Neither is
-    a permanent verdict on the Case -- a later batch's Case Enrichment
-    retry can still resolve either gap; this module has no retry logic of
-    its own and does not track any such history:
+    impossible to miss. Neither is a permanent verdict on the Case -- a
+    later batch's Case Enrichment retry can still resolve either gap:
       * `cases_missing_analysis` -- case_id of every window Case with NO
         case_analysis row at all yet.
       * `cases_with_unparseable_analysis` -- case_id of every window Case
@@ -315,16 +262,11 @@ class ReflectorInput:
     Neither bucket is included in `cases`, `analyzed_case_count`, or any
     by_* aggregation.
 
-    Count semantics (Slice 1.1 clarification -- see this module's
-    docstring for why a single ambiguous `total_cases` was replaced):
+    Count semantics:
       * `window_case_count` -- how many Cases actually occurred in this
-        window (from list_case_ids_created_in_window()), regardless of
-        analysis status. This is the "how many support issues happened"
-        number.
+        window, regardless of analysis status.
       * `analyzed_case_count` -- how many of those Cases are actually
-        USABLE by a Reflector step right now: successfully analyzed AND
-        successfully parsed, i.e. exactly `len(cases)`. This is the "how
-        many Cases does ReflectorInput.cases actually cover" number.
+        USABLE by a Reflector step right now, i.e. exactly `len(cases)`.
     These are deliberately two different numbers -- reading
     `analyzed_case_count` alone as "how many Cases happened this window"
     would understate the window whenever coverage is incomplete. Exact
@@ -339,23 +281,15 @@ class ReflectorInput:
     analyzed_case_count / window_case_count, or 0.0 when
     window_case_count is 0 (an empty window has nothing to cover, not
     "100% coverage of nothing"). NOT used as a hard gate anywhere in this
-    module -- see is_reflection_eligible() (a separate, orchestration-
-    policy function) for the actual eligibility decision, which
-    deliberately does NOT read coverage_ratio at all (see that function's
-    docstring for why).
+    module -- see is_reflection_eligible() for the actual eligibility
+    decision, which deliberately does NOT read coverage_ratio at all.
 
     `by_product_model`/`by_issue_type`/`by_diagnosis` are computed ONLY
     over `cases` and sum to `analyzed_case_count` -- NEVER
-    `window_case_count` -- pure counting, no interpretation. by_* values
-    are immutable (types.MappingProxyType, see this module's docstring for
-    why that is a serialization boundary, not a JSON-ready shape) and
-    key-sorted for deterministic iteration; by_product_model uses
+    `window_case_count`. by_* values are immutable (types.MappingProxyType
+    -- a serialization boundary, not a JSON-ready shape) and key-sorted
+    for deterministic iteration; by_product_model uses
     UNKNOWN_PRODUCT_MODEL_BUCKET for a Case with product_model=None.
-
-    Deliberately carries no LLM behavior, no persistence, no scheduler
-    concept, and no eligibility-threshold policy (see is_reflection_eligible)
-    -- exactly the same "contract only, no side effects" shape as
-    tools.case_enrichment.CaseEnrichmentInput.
     """
 
     window_start: str | None
@@ -475,9 +409,7 @@ def build_reflector_input(
         ReflectorInput
 
     Uses only tools.feedback_store_v2.FeedbackStoreV2 query methods -- no
-    raw SQL in this module, matching tools.case_enrichment's own "Storage
-    queries stay in tools.feedback_store_v2" convention (see that module's
-    docstring).
+    raw SQL in this module.
 
     Missing-analysis handling: a Case whose creation time falls inside
     [window_start, window_end) but that has never been analyzed (no
@@ -487,33 +419,21 @@ def build_reflector_input(
     valid CaseIntelligenceRecord (malformed evidence_json, or a value that
     no longer matches the current taxonomy) is recorded in
     ReflectorInput.cases_with_unparseable_analysis, never merged into
-    `cases` and never dropped without a trace. `analyzed_case_count` and
-    every by_* aggregation are computed ONLY over `cases` (the
-    successfully reconstructed records) -- `window_case_count` is the
-    separate, larger number that also counts the two gap buckets (see
-    ReflectorInput's own docstring for the exact invariant and why the two
-    counts must not be conflated).
+    `cases` and never dropped without a trace.
 
     This function deliberately does NOT hard-fail the whole build when
-    some window Cases lack analysis. The normal Phase 5 batch cycle already
-    runs Case Enrichment immediately before Reflector, but
-    tools.run_case_enrichment.py's own per-Case outcome handling
-    (build_failed/analyze_failed/persist_failed -- see that module's
-    _process_case) proves a real production batch can legitimately leave
-    some Cases unanalyzed even in an otherwise-healthy run; aborting the
-    entire Reflector input for one such gap would make the whole pipeline
-    fragile for no real safety benefit, and this codebase has no existing
-    precedent for a hard batch-level failure mode at this layer. Instead,
-    the gap is made a first-class, impossible-to-miss field on the
-    returned contract -- satisfying "never silently drop" without
-    inventing a new failure mode.
+    some window Cases lack analysis -- a real production batch can
+    legitimately leave some Cases unanalyzed even in an otherwise-healthy
+    run; aborting the entire Reflector input for one such gap would make
+    the whole pipeline fragile for no real safety benefit. Instead, the
+    gap is made a first-class, impossible-to-miss field on the returned
+    contract.
 
     Does not catch exceptions raised by the store.* calls themselves -- a
-    real database/connectivity failure propagates to the caller unchanged,
-    matching every FeedbackStoreV2 query method this composes, none of
-    which swallow their own DB errors. There is no meaningful "empty
-    ReflectorInput" fallback for a DB failure that would not misrepresent
-    an error as "zero Cases in this window".
+    real database/connectivity failure propagates to the caller unchanged.
+    There is no meaningful "empty ReflectorInput" fallback for a DB
+    failure that would not misrepresent an error as "zero Cases in this
+    window".
     """
     case_ids = store.list_case_ids_created_in_window(
         created_from=window_start, created_before=window_end,
@@ -566,11 +486,8 @@ def build_reflector_input(
 # the ReflectorInput data contract above (see this module's docstring)
 # ---------------------------------------------------------------------------
 
-# First-cut POC default (Phase 5 task instruction) -- a plain, unenforced
-# default a caller may override, never a value baked into ReflectorInput
-# itself. Matches the tools.case_routing.DEFAULT_CONFIDENCE_THRESHOLD
-# convention: a named module-level constant used as a function's default
-# keyword argument, not a hidden magic number.
+# First-cut POC default -- a plain, unenforced default a caller may
+# override, never a value baked into ReflectorInput itself.
 DEFAULT_MIN_ANALYZED_CASES_FOR_REFLECTION = 5
 
 
@@ -588,25 +505,14 @@ def is_reflection_eligible(
     unparseable), so gating on it would let a window with many occurrences
     but few usable analyses pass eligibility on the strength of Cases the
     Reflector will never actually see. coverage_ratio is deliberately kept
-    observational-only in this slice (see ReflectorInput's docstring) --
-    not read here either, so a small-but-fully-covered window (e.g. 5
-    analyzed out of 5 occurred) and a large-but-partially-covered window
-    (e.g. 5 analyzed out of 50 occurred) are judged identically by this
-    function, exactly matching the "analyzed_case_count >= min_analyzed_cases"
-    semantics the task specifies -- coverage-aware gating is an explicit
-    non-goal of this slice.
+    observational-only, not read here either -- coverage-aware gating is
+    an explicit non-goal.
 
     `min_analyzed_cases` is a caller-supplied ORCHESTRATION POLICY
-    parameter, never a ReflectorInput field -- a future batch runner (not
-    built in this slice) decides the real threshold; this function only
-    evaluates one already-decided threshold against one already-built
-    ReflectorInput. Fails closed on an invalid threshold: raises
-    ValueError immediately for a non-int or non-positive
-    min_analyzed_cases, matching tools.case_routing.validate_case_routing's
-    own convention for confidence_threshold ("a non-numeric or
-    out-of-range ... is a caller programming error, not a data-quality
-    problem ... raises ValueError immediately") -- an invalid threshold is
-    the caller's bug, not something to fold into a False return.
+    parameter, never a ReflectorInput field. Fails closed on an invalid
+    threshold: raises ValueError immediately for a non-int or non-positive
+    min_analyzed_cases -- an invalid threshold is the caller's bug, not
+    something to fold into a False return.
     """
     if (
         isinstance(min_analyzed_cases, bool)

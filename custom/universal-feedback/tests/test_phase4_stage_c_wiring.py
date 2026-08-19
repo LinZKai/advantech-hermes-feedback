@@ -222,17 +222,6 @@ class CandidateLoadingTests(_StoreTestCase):
 
 
 class CaseRoutingPromptTests(unittest.TestCase):
-    def test_prompt_lists_all_candidate_ids(self):
-        candidates = [
-            {"case_id": "case-a", "first_user_question": "ADAM-6266 要怎麼關閉 SNMP？"},
-            {"case_id": "case-b", "first_user_question": "WISE-6610 LTE 訊號很弱怎麼辦？"},
-        ]
-        prompt = build_case_routing_prompt(candidates)
-        self.assertIn("case-a", prompt)
-        self.assertIn("case-b", prompt)
-        self.assertIn("ADAM-6266 要怎麼關閉 SNMP？", prompt)
-        self.assertIn("WISE-6610 LTE 訊號很弱怎麼辦？", prompt)
-
     def test_prompt_includes_latest_only_when_present(self):
         candidates = [
             {"case_id": "case-a", "first_user_question": "first only"},
@@ -333,6 +322,28 @@ def _valid_envelope_text(action="new", case_id=None, confidence=0.9):
     return f"{CASE_ROUTING_OPEN_DELIM}{body}{CASE_ROUTING_CLOSE_DELIM}"
 
 
+# ---------------------------------------------------------------------------
+# Shared malformed Case Routing envelope fixtures, reused below by BOTH
+# StreamEnvelopeFilterTests (the live streaming display filter,
+# _StreamEnvelopeFilter) and NonStreamingEnvelopeLeakSafetyTests (the
+# non-streaming authoritative strip in run.py's _run_agent_inner). These are
+# two genuinely different code paths -- one incrementally buffers chunks,
+# the other parses one complete string -- so they are NOT collapsed into a
+# single shared test; only the malformed-shape TEXT itself is defined once
+# to avoid re-typing the same garbage bytes in both classes.
+# ---------------------------------------------------------------------------
+
+_MALFORMED_ENVELOPE_JSON_BODY = "{not valid json"
+_OVERSIZED_ENVELOPE_PADDING = "x" * (MAX_ENVELOPE_PREFIX_BYTES + 500)
+
+
+def _unsupported_routing_version_body() -> str:
+    return json.dumps({
+        "case_action": "new", "case_id": None,
+        "confidence": 0.9, "routing_version": "case-router-v0",
+    })
+
+
 class StreamEnvelopeFilterTests(unittest.TestCase):
     def _run(self, chunks):
         out = []
@@ -383,21 +394,32 @@ class StreamEnvelopeFilterTests(unittest.TestCase):
         self.assertNotIn("case_action", joined)
         self.assertNotIn("case-a", joined)
 
-    def test_invalid_envelope_never_visible_to_consumer(self):
-        malformed = CASE_ROUTING_OPEN_DELIM + "{not valid json" + CASE_ROUTING_CLOSE_DELIM + "answer"
+    def test_invalid_envelope_never_visible_and_answer_still_delivered(self):
+        # Malformed JSON between well-formed delimiters, fed as one chunk:
+        # neither the garbage body nor the delimiter itself may reach the
+        # consumer, and the real answer after the close delimiter must
+        # still be delivered intact.
+        malformed = (
+            CASE_ROUTING_OPEN_DELIM + _MALFORMED_ENVELOPE_JSON_BODY + CASE_ROUTING_CLOSE_DELIM + "the real answer"
+        )
         out = self._run([malformed])
         joined = "".join(out)
+        self.assertEqual(joined, "the real answer")
         self.assertNotIn(CASE_ROUTING_OPEN_DELIM, joined)
-        self.assertNotIn("not valid json", joined)
-
-    def test_answer_after_invalid_envelope_still_delivered(self):
-        malformed = CASE_ROUTING_OPEN_DELIM + "{broken" + CASE_ROUTING_CLOSE_DELIM + "the real answer"
-        out = self._run([malformed])
-        self.assertEqual("".join(out), "the real answer")
+        self.assertNotIn(_MALFORMED_ENVELOPE_JSON_BODY, joined)
 
     def test_oversized_prefix_does_not_leak_control_frame(self):
-        padding = "x" * (MAX_ENVELOPE_PREFIX_BYTES + 500)
-        chunks = [CASE_ROUTING_OPEN_DELIM + padding, CASE_ROUTING_CLOSE_DELIM + "answer after giving up"]
+        # Split across chunks on purpose (unlike the malformed-JSON case
+        # above): this proves the filter gives up mid-stream once the
+        # buffered candidate exceeds MAX_ENVELOPE_PREFIX_BYTES, and that a
+        # closing delimiter arriving in a LATER chunk (after give-up) is
+        # then treated as plain text rather than re-triggering envelope
+        # detection -- a chunk-boundary behavior the non-streaming leg has
+        # no equivalent of, since it parses one already-complete string.
+        chunks = [
+            CASE_ROUTING_OPEN_DELIM + _OVERSIZED_ENVELOPE_PADDING,
+            CASE_ROUTING_CLOSE_DELIM + "answer after giving up",
+        ]
         out = self._run(chunks)
         joined = "".join(out)
         self.assertNotIn("x" * 100, joined)  # none of the padding ever leaked
@@ -450,6 +472,32 @@ class _SourceTestCase(unittest.TestCase):
     def setUpClass(cls):
         cls.run_py_text = _RUN_PY.read_text(encoding="utf-8")
         cls.base_py_text = _BASE_PY.read_text(encoding="utf-8")
+
+
+class StartupFeedbackStoreInitWiringTests(_SourceTestCase):
+    """Fresh-onboard DB initialization must not require a manual
+    `FeedbackStoreV2(...)` construction -- GatewayRunner.start() eagerly
+    (and idempotently) initializes the store once at process startup."""
+
+    def test_get_store_called_eagerly_in_start(self):
+        self.assertIn(
+            "from tools.retrieval_runtime import get_store as _get_feedback_store",
+            self.run_py_text,
+        )
+        self.assertIn("_get_feedback_store()", self.run_py_text)
+
+    def test_eager_init_happens_inside_start_after_gateway_state_starting(self):
+        start_idx = self.run_py_text.index("async def start(self) -> bool:")
+        starting_state_idx = self.run_py_text.index(
+            'write_runtime_status(gateway_state="starting", exit_reason=None)', start_idx
+        )
+        init_idx = self.run_py_text.index("_get_feedback_store()", start_idx)
+        self.assertGreater(init_idx, starting_state_idx)
+
+    def test_eager_init_never_raises_out_of_start(self):
+        init_idx = self.run_py_text.index("_get_feedback_store()")
+        surrounding = self.run_py_text[max(0, init_idx - 400):init_idx]
+        self.assertIn("try:", surrounding)
 
 
 class StreamingCallbackWiringTests(_SourceTestCase):
@@ -759,39 +807,45 @@ class NonStreamingEnvelopeLeakSafetyTests(_SourceTestCase):
         self.assertNotIn(CASE_ROUTING_OPEN_DELIM, delivered)
         self.assertEqual(routing.status, "valid")
 
-    def test_malformed_json_envelope_never_reaches_non_streaming_delivery(self):
-        raw = CASE_ROUTING_OPEN_DELIM + "{not valid json" + CASE_ROUTING_CLOSE_DELIM + "the real answer"
-        stripped, routing = _apply_authoritative_strip(raw)
-        delivered = _non_streaming_delivered_text(stripped)
-        self.assertNotIn(CASE_ROUTING_OPEN_DELIM, delivered)
-        self.assertNotIn("not valid json", delivered)
-
-    def test_incomplete_unclosed_envelope_never_reaches_non_streaming_delivery(self):
-        # The model's turn ends mid-envelope -- no closing delimiter ever
-        # arrives (e.g. truncated by a length limit or upstream error).
-        raw = CASE_ROUTING_OPEN_DELIM + '{"case_action":"existing"'
-        stripped, routing = _apply_authoritative_strip(raw)
-        delivered = _non_streaming_delivered_text(stripped)
-        self.assertNotIn(CASE_ROUTING_OPEN_DELIM, delivered)
-
-    def test_oversized_envelope_never_reaches_non_streaming_delivery(self):
-        padding = "x" * (MAX_ENVELOPE_PREFIX_BYTES + 500)
-        raw = CASE_ROUTING_OPEN_DELIM + padding + CASE_ROUTING_CLOSE_DELIM + "the real answer"
-        stripped, routing = _apply_authoritative_strip(raw)
-        delivered = _non_streaming_delivered_text(stripped)
-        self.assertNotIn(CASE_ROUTING_OPEN_DELIM, delivered)
-        self.assertNotIn("x" * 100, delivered)
-
-    def test_unsupported_routing_version_never_reaches_non_streaming_delivery(self):
-        body = json.dumps({
-            "case_action": "new", "case_id": None,
-            "confidence": 0.9, "routing_version": "case-router-v0",
-        })
-        raw = CASE_ROUTING_OPEN_DELIM + body + CASE_ROUTING_CLOSE_DELIM + "the real answer"
-        stripped, routing = _apply_authoritative_strip(raw)
-        delivered = _non_streaming_delivered_text(stripped)
-        self.assertNotIn(CASE_ROUTING_OPEN_DELIM, delivered)
-        self.assertNotIn("case_action", delivered)
+    def test_malformed_envelope_shapes_never_reach_non_streaming_delivery(self):
+        # Four malformed shapes, all proven against the one real run.py
+        # snippet extracted above -- this leg parses one already-complete
+        # string (no chunk-boundary concerns, unlike the streaming filter),
+        # so each shape's outcome can be checked uniformly in one loop
+        # without changing what each case individually proves.
+        cases = (
+            (
+                "malformed_json",
+                CASE_ROUTING_OPEN_DELIM + _MALFORMED_ENVELOPE_JSON_BODY + CASE_ROUTING_CLOSE_DELIM,
+                (_MALFORMED_ENVELOPE_JSON_BODY,),
+            ),
+            (
+                # The model's turn ends mid-envelope -- no closing
+                # delimiter ever arrives (e.g. truncated by a length limit
+                # or upstream error).
+                "unclosed",
+                CASE_ROUTING_OPEN_DELIM + '{"case_action":"existing"',
+                (),
+            ),
+            (
+                "oversized",
+                CASE_ROUTING_OPEN_DELIM + _OVERSIZED_ENVELOPE_PADDING + CASE_ROUTING_CLOSE_DELIM,
+                ("x" * 100,),
+            ),
+            (
+                "unsupported_routing_version",
+                CASE_ROUTING_OPEN_DELIM + _unsupported_routing_version_body() + CASE_ROUTING_CLOSE_DELIM,
+                ("case_action",),
+            ),
+        )
+        for name, envelope_prefix, forbidden in cases:
+            with self.subTest(shape=name):
+                raw = envelope_prefix + "the real answer"
+                stripped, routing = _apply_authoritative_strip(raw)
+                delivered = _non_streaming_delivered_text(stripped)
+                self.assertNotIn(CASE_ROUTING_OPEN_DELIM, delivered)
+                for token in forbidden:
+                    self.assertNotIn(token, delivered)
 
 
 if __name__ == "__main__":

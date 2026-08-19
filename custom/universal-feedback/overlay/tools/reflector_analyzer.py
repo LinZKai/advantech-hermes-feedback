@@ -1,179 +1,47 @@
-"""Phase 5 Slice 5A/5B: the Reflector auxiliary LLM integration --
-structured-output parser + deterministic validation (5A), and the real
-call_llm() wiring that produces the JSON this parser consumes (5B).
+"""The Reflector auxiliary LLM integration: structured-output parser and
+deterministic validation, plus the call_llm() wiring that produces the
+JSON this parser consumes.
 
-    ReflectorPromptContext
-    (tools.reflector_prompt_context)
+    ReflectorPromptContext (tools.reflector_prompt_context)
      |
      v
-    _build_messages()                  (this module -- dedicated Reflector
-     |                                   prompt, no SOUL/memory/Skills/
-     |                                   tools/session history)
+    _build_messages()        (dedicated Reflector prompt -- no SOUL/memory/
+     |                         Skills/tools/session history)
      v
-    call_llm()                         (agent.auxiliary_client -- Hermes'
-     |                                   existing side-task inference
-     |                                   boundary, injected via `llm_call`
-     |                                   for testability; same boundary
-     |                                   tools.case_enrichment_analyzer
-     |                                   already uses)
+    call_llm()                (agent.auxiliary_client -- Hermes' side-task
+     |                         inference boundary, injected via `llm_call`
+     |                         for testability)
      v
-    _extract_text()                    (this module -- minimal OpenAI-
-     |                                   compatible response reader)
+    _extract_text()           (minimal OpenAI-compatible response reader)
      v
     json.loads()
-     |
      v
-    parse_reflector_output()           (this module -- strict shape check,
-                |                        candidate-bound / case-id-bound
-                |                        deterministic validation, fail
-                |                        closed)
-                v
-    ReflectionResult                   (tools.reflector_proposals -- reused
-                                         unchanged; this module builds no
-                                         new public type)
+    parse_reflector_output()  (strict shape check, candidate-bound /
+     |                         case-id-bound deterministic validation,
+     |                         fail closed)
+     v
+    ReflectionResult (tools.reflector_proposals)
 
-Slice 5A scope: the stable reasoning-policy prompt text
-(`_SYSTEM_INSTRUCTIONS` / `_OUTPUT_SCHEMA_HINT`) and the deterministic
-parser (`parse_reflector_output`) -- no LLM call.
+This module calls call_llm() directly, not run_conversation(): the
+Reflector analyzes already-structured Case Intelligence evidence and must
+never re-query retrieval, see SOUL/memory/session history, or gain access
+to conversational tools.
 
-Slice 5B scope (this addition): `analyze_reflection_with_llm()`, the real
-call_llm() wiring, and `ReflectorAnalyzerError`, the single analyzer-layer
-exception type. Still no persistence anywhere in this module
-(FeedbackStoreV2 is never imported here; `reflection_runs`/
-`improvement_proposals`/`proposal_observations` are never written) -- this
-module's only output is an in-memory `ReflectionResult`, matching how
-tools.case_enrichment_analyzer.analyze_case_with_llm() never calls
-create_case_analysis() either (that stays a runner's job -- Slice 6 here,
-Stage D2 there).
+`llm_call` defaults to a lazy import of `agent.auxiliary_client.call_llm`
+(resolved inside the function body) because that module only exists inside
+a built Hermes sandbox image -- this repo's test environment does not have
+it installed, and every test injects a fake `llm_call` instead.
 
-Why this module calls call_llm() directly and not run_conversation()
-(mirrors tools.case_enrichment_analyzer's own reasoning, restated here for
-the Reflector): Reflector analyzes previously-collected, already-
-structured Case Intelligence evidence; it must never re-query Foundry IQ,
-never see SOUL/memory/session history, and never gain access to
-conversational tools -- `call_llm()` is Hermes' existing, independent
-side-task inference boundary (already used by tools.case_enrichment_
-analyzer for exactly this reason) that takes a plain, caller-controlled
-`messages` list with zero implicit injection.
-
-`llm_call` is dependency-injected and defaults to a LAZY import of
-`agent.auxiliary_client.call_llm` (resolved inside the function body, not
-at module import time) because `agent.auxiliary_client` only exists inside
-a built Hermes sandbox image (/opt/hermes/agent/...) -- this repo's own
-test environment does not have it installed, and must never need it: every
-test in test_reflector_analyzer.py injects a fake `llm_call`.
-
-Reuse, not reinvention (see the Phase 5 Slice 5A reconnaissance report for
-the full audit this follows): this module builds no new dataclass. The
-finding shape a future model response carries maps directly onto types
-Slice 2/Slice 3 already built and already validate themselves:
-
-    finding.resolution   -> tools.proposal_matching.ProposalResolution,
-                             checked by that module's own
-                             validate_proposal_resolution() against the
-                             caller-supplied `candidates` -- never
-                             re-implemented here.
-    finding.{trend, pattern_summary, possible_cause,
-             recommended_improvement, expected_benefit, limitations,
-             supporting_case_ids, confidence}
-                          -> tools.reflector_proposals.ProposalObservation
-                             fields -- that dataclass's own __post_init__
-                             already enforces every taxonomy/confidence/
-                             cross-field rule (trend value, confidence
-                             range, supporting_case_ids shape, the
-                             trend-requires-supporting-cases rule); this
-                             module never duplicates any of those checks.
-    a create_new finding's title
-                          -> tools.reflector_proposals.ImprovementProposal
-                             (this module's own responsibility: only
-                             `parse_reflector_output` decides WHEN a new
-                             ImprovementProposal is warranted -- one per
-                             create_new finding -- and generates its
-                             identity; see "IDs and timestamps" below).
-
-The one genuinely new deterministic guardrail this slice adds is the
-Supporting Case allowlist (see `_parse_finding`'s docstring): no existing
-Slice 1-4 contract checks a finding's supporting_case_ids against the set
-of Case ids actually present in the ReflectorPromptContext the model was
-given, because no earlier slice had both a finding-shaped model response
-and a Case allowlist to check it against at the same time.
-
-IDs and timestamps (Phase 5 Slice 5A task instruction, section 17): the
-model never produces `reflection_run_id`, `observation_id`, a create_new
-finding's `proposal_id`, `supporting_case_count`, `observed_at`, or
-`created_at` -- exactly like tools.case_enrichment_analyzer.
-analyze_case_with_llm() never asks the model for `analysis_id`/
-`analyzed_at`. Unlike that analyzer, though, this module's own return type
-(ReflectionResult) itself carries id/timestamp-bearing nested objects
-(ImprovementProposal, ProposalObservation) -- Slice 2 built those as
-identity-bearing records, not id-free like CaseEnrichmentResult -- so this
-parser cannot defer id/timestamp generation to a later runner stage the
-way tools.run_case_enrichment's `_process_case()` does for `analysis_id`/
-`analyzed_at` (see that function's own `uuid.uuid4().hex` +
-`datetime.now(timezone.utc).isoformat()` call site, the established
-convention this module's defaults mirror). `parse_reflector_output()`
-therefore accepts `observed_at` as a required, caller-supplied string
-(matching how `create_reflection_run(started_at=...)` already takes the
-run's own timing as a plain caller-supplied argument, never self-computed)
-and `id_factory` as a keyword-only, minimal dependency injection point
-(default `lambda: uuid.uuid4().hex`, the exact literal already used by
-tools.run_case_enrichment) -- purely so a test can supply a deterministic,
-predictable id sequence instead of a real random UUID. This is one small
-callable, not a generic ID-factory framework: the same `id_factory` is
-reused for both a create_new finding's new `proposal_id` and every
-finding's `observation_id` (uuid4 collision between the two is not a
-real-world concern, and two separate factory parameters would be
-unjustified complexity for what is structurally the same "give me a fresh
-opaque id string" operation).
-
-A create_new finding's ImprovementProposal.created_at is set to the SAME
-`observed_at` value as its founding ProposalObservation.observed_at --
-never a separately generated timestamp -- because
-tools.reflector_proposals.ImprovementProposal's own docstring already
-states this explicitly: "within this slice's actual code paths, a Proposal
-is only ever created once, at the exact moment its first Observation is
-produced, so the two would always hold the identical value." This module
-follows that documented invariant rather than inventing a second timestamp
-with no semantic difference from the first.
-
-Title contract (Phase 5 Slice 5A task instruction, section 18 -- resolved
-here, not left ambiguous): `title` is a required key on every finding (part
-of this module's own strict key-set check), but its legal VALUE depends on
-`resolution.action`, mirroring the exact "no in-between state" strictness
-tools.case_enrichment.CaseEnrichmentResult already uses for its own
-product_model/product_source/product_confidence null-triad:
-
-    action == "create_new"     -> title MUST be a non-blank string (a new
-                                   ImprovementProposal cannot be created
-                                   without one).
-    action == "match_existing" -> title MUST be `null` (`None`). A
-                                   match_existing finding never creates or
-                                   renames an ImprovementProposal, so a
-                                   model-supplied title here has no
-                                   destination to write to; rather than
-                                   silently accepting and discarding an
-                                   arbitrary string (which would let a
-                                   model's title opinion influence nothing
-                                   while looking like it was consumed),
-                                   this module fails the whole parse
-                                   closed, exactly as strict as the
-                                   product_model=None/product_source-must-
-                                   also-be-None rule this mirrors.
-
-Possible_cause / expected_benefit / limitations nullability (a resolved
-conflict between this slice's task instruction and Slice 2's already-
-established contract -- see this module's implementation report for the
-full note): the task instruction's own illustrative JSON shows these three
-fields as plain `"string"`, but tools.reflector_proposals.
-ProposalObservation already declares all three OPTIONAL (`str | None`) on
-purpose ("the AI may legitimately have nothing supportable to state for
-one of them on a given Observation ... None must never be forced into a
-fabricated one-line placeholder"). Per this slice's own instruction
-(section 23: existing Slice 1-4 contracts are the source of truth, never
-silently narrowed to fit a new prompt), this module's schema hint documents
-all three as nullable and its parser accepts `null` for any of them --
-ProposalObservation's own __post_init__ still enforces "a non-None value
-must be a non-blank string" either way.
+A few behaviors worth knowing before editing:
+- `parse_reflector_output()` fails the WHOLE parse closed on any single
+  invalid finding -- there is no "skip the bad finding" mode.
+- A finding's `title` must be non-blank when action=create_new and null
+  when action=match_existing; either mismatch fails the parse.
+- `supporting_case_ids` are checked against the Case ids actually present
+  in the given ReflectorPromptContext -- a hallucinated case_id fails the
+  parse.
+- A create_new finding's ImprovementProposal.created_at is set to the same
+  `observed_at` value as its founding ProposalObservation.observed_at.
 """
 from __future__ import annotations
 
@@ -199,23 +67,13 @@ from tools.reflector_proposals import (
 # Prompt + reasoning-policy generation version -- bump only on a breaking
 # change to _SYSTEM_INSTRUCTIONS' semantics or the ReflectionResult/
 # ProposalResolution contract, never for routine prompt wording tweaks.
-# Mirrors tools.case_enrichment_analyzer.ANALYSIS_VERSION's exact naming
-# and versioning convention (a plain, non-timestamp string -- see that
-# constant's own docstring for why); a future Slice 6B runner is expected
-# to pass this as create_reflection_run()'s reflector_version argument,
-# the same way tools.run_case_enrichment already passes ANALYSIS_VERSION
-# to create_case_analysis()'s analysis_version argument.
 REFLECTOR_VERSION = "reflector-v1"
 
 # ---------------------------------------------------------------------------
-# Reasoning policy -- stable, model-facing instructions. Not runtime
-# implementation, not a DB/storage instruction of any kind (mirrors tools.
-# case_enrichment_analyzer._SYSTEM_INSTRUCTIONS's own "prompt boundary"
-# framing). Taxonomy value lists are interpolated from imported constants,
-# never hard-coded, so this text can never silently drift out of sync with
-# the actual ProposalResolution/ProposalObservation/ImprovementProposal
-# contracts (same convention tools.case_enrichment_analyzer already
-# established for its own _SYSTEM_INSTRUCTIONS).
+# Reasoning policy -- stable, model-facing instructions. Taxonomy value
+# lists are interpolated from imported constants, never hard-coded, so this
+# text can never silently drift out of sync with the actual
+# ProposalResolution/ProposalObservation/ImprovementProposal contracts.
 # ---------------------------------------------------------------------------
 
 _OUTPUT_SCHEMA_HINT = f"""{{
@@ -321,36 +179,17 @@ def _parse_finding(
     observed_at: str,
     id_factory: Callable[[], str],
 ) -> tuple[ImprovementProposal | None, ProposalObservation] | None:
-    """Parse and validate one raw finding, or return None on any failure.
-
-    Any structural problem (wrong shape, wrong key-set, invalid taxonomy,
-    hallucinated proposal_id, target mismatch, hallucinated case_id,
-    invalid confidence) is reported as None to its own caller,
-    parse_reflector_output() -- this function itself is not required to be
-    exception-free in isolation (a duplicate proposal_id inside
-    `candidates`, a caller-assembled-collection bug rather than a property
-    of `raw_finding`, surfaces here as a ValueError from
-    validate_proposal_resolution()), but parse_reflector_output() wraps
-    every call to this function in one try/except that already treats any
-    ValueError/TypeError the same way a malformed `raw_finding` is treated:
-    fail the whole parse closed. See that function's own docstring.
+    """Parse and validate one raw finding, or return None on any failure
+    (wrong shape, wrong key-set, invalid taxonomy, hallucinated proposal_id,
+    target mismatch, hallucinated case_id, invalid confidence). A duplicate
+    proposal_id inside `candidates` instead raises ValueError from
+    validate_proposal_resolution(), caught by parse_reflector_output()'s
+    own try/except.
 
     Returns (new_proposal_or_None, observation) on success: a create_new
-    finding returns (ImprovementProposal, ProposalObservation) -- exactly
-    one founding Observation for the new Proposal it also returns, matching
-    ReflectionResult's own "every new_proposals entry requires a
-    corresponding proposal_observations entry" invariant. A match_existing
-    finding returns (None, ProposalObservation) -- it never creates or
-    renames an ImprovementProposal (see this module's own docstring,
-    "Title contract").
-
-    The Supporting Case allowlist check below is the one genuinely new
-    deterministic guardrail this slice adds (see this module's own
-    docstring) -- no earlier slice checks a finding's supporting_case_ids
-    against the Case ids actually present in the ReflectorPromptContext the
-    model was given; every other check here already exists on
-    ProposalResolution/ProposalObservation/ImprovementProposal and is only
-    invoked, never re-implemented.
+    finding returns (ImprovementProposal, ProposalObservation); a
+    match_existing finding returns (None, ProposalObservation) since it
+    never creates or renames an ImprovementProposal.
     """
     if not isinstance(raw_finding, Mapping) or set(raw_finding.keys()) != _FINDING_REQUIRED_KEYS:
         return None
@@ -427,45 +266,23 @@ def parse_reflector_output(
     """Validate an already-decoded Python mapping (e.g. json.loads() output)
     into a ReflectionResult, or return None if it is not a legal one.
 
-    Mirrors tools.case_enrichment.parse_case_enrichment_result's own
-    contract shape: only handles an already-decoded mapping (no markdown
-    code-fence stripping, no streaming-chunk buffering -- this slice is not
-    wired to any model call; that is Slice 5B's job), strict key-set
-    validation at every nesting level, never raises for a malformed/
-    adversarial `data` -- any structural problem anywhere (wrong root type,
-    missing/extra keys at the top level or inside any finding/resolution,
-    an invalid taxonomy value, a hallucinated proposal_id, an
-    improvement_target mismatch against the matched candidate, a
-    hallucinated/unlisted case_id, an out-of-range or non-numeric
-    confidence, or any ReflectionResult/ImprovementProposal/
-    ProposalObservation `__post_init__` rejection) returns None. Fail
+    Only handles an already-decoded mapping (no markdown code-fence
+    stripping, no streaming-chunk buffering). Never raises for a malformed/
+    adversarial `data`; any structural problem anywhere returns None. Fail
     closed, never partial: a single invalid finding fails the WHOLE parse,
-    not just that finding -- there is no "skip the bad finding and keep the
-    rest" mode, matching the Phase 5 Slice 5A task instruction's explicit
-    "整個 parse fail closed" requirement.
+    not just that finding.
 
     `candidates` and `valid_case_ids` are the SAME two collections the
     model was actually shown for this run -- normally
     `ReflectorPromptContext.existing_proposals` and `{{c.case_id for c in
-    ReflectorPromptContext.cases}}` respectively (see tools.
-    reflector_prompt_context). This function never queries a store for
-    either; both are plain caller-supplied arguments, exactly like tools.
-    case_routing.validate_case_routing's own `candidate_case_ids` parameter
-    for the structurally identical Case Routing problem.
+    ReflectorPromptContext.cases}}`. This function never queries a store
+    for either.
 
     `reflection_run_id`/`observed_at` are plain caller-supplied strings,
-    never generated here -- a future Slice 5B/6 runner is expected to
-    generate `reflection_run_id` the same way tools.run_case_enrichment
-    already generates `analysis_id` (`uuid.uuid4().hex`) and `observed_at`
-    the same way it already generates `analyzed_at`
-    (`datetime.now(timezone.utc).isoformat()`), then call
-    `create_reflection_run()` with that same id before calling this
-    function -- none of that persistence/orchestration is built in this
-    slice. `id_factory` is a minimal, keyword-only dependency injection
-    point (default `lambda: uuid.uuid4().hex`) used for every id this
-    function itself must mint (a create_new finding's new proposal_id,
-    and every finding's observation_id) -- see this module's own docstring
-    for why one factory is enough.
+    never generated here. `id_factory` is a minimal, keyword-only
+    dependency injection point (default `lambda: uuid.uuid4().hex`) used
+    for every id this function itself must mint (a create_new finding's
+    new proposal_id, and every finding's observation_id).
     """
     if not isinstance(data, Mapping) or set(data.keys()) != _RESULT_REQUIRED_KEYS:
         return None
@@ -518,33 +335,20 @@ class ReflectorAnalyzerError(RuntimeError):
     """Raised by analyze_reflection_with_llm() for any failure that
     prevents producing a valid ReflectionResult -- provider/network
     failure, empty response, invalid JSON, or parse_reflector_output()
-    rejecting the decoded response. A single, minimal exception type on
-    purpose, matching tools.case_enrichment_analyzer.
-    CaseEnrichmentAnalyzerError's own "one exception type, message carries
-    the detail" convention -- the message + chained __cause__ (via
-    `raise ... from exc`) carries the failure detail for logs/debugging
-    instead of a multi-class hierarchy. A caller never needs to know
-    whether a given failure was a provider error, a malformed response, or
-    a rejected (e.g. hallucinated-id) response -- all three mean the same
-    thing to it: "this Reflection Run produced no usable result."
+    rejecting the decoded response. A single, minimal exception type: the
+    message + chained __cause__ carries the failure detail instead of a
+    multi-class hierarchy, since a caller never needs to distinguish a
+    provider error from a rejected response -- both mean "this Reflection
+    Run produced no usable result."
     """
 
 
 def _build_messages(context: ReflectorPromptContext) -> list[dict[str, str]]:
     """Exactly two messages: system reasoning policy + serialized
     ReflectorPromptContext. Nothing else -- no session history, no SOUL, no
-    tool definitions, no re-retrieval instructions. This is the entire
-    prompt boundary (mirrors tools.case_enrichment_analyzer._build_
-    messages's own "no other context leaks in" guarantee).
-
-    Reuses serialize_reflector_prompt_context() (Slice 4) unchanged -- this
-    module builds no second, competing context serializer. Business/
-    reasoning policy (recurring-pattern semantics, improvement_target
-    meaning, match/new judgment, evidence discipline, etc.) lives entirely
-    in `_SYSTEM_INSTRUCTIONS`, never repeated or diluted into this user
-    message -- the user message is only ever a label plus the deterministic
-    JSON payload, matching _build_messages's own precedent in tools.
-    case_enrichment_analyzer (`f"Case evidence (JSON):\\n{evidence_json}"`).
+    tool definitions, no re-retrieval instructions. Business/reasoning
+    policy lives entirely in `_SYSTEM_INSTRUCTIONS`; the user message is
+    only ever a label plus the deterministic JSON payload.
     """
     serialized = serialize_reflector_prompt_context(context)
     return [
@@ -556,12 +360,9 @@ def _build_messages(context: ReflectorPromptContext) -> list[dict[str, str]]:
 def _extract_text(response: Any) -> str:
     """Pull the assistant text out of the OpenAI-compatible response object
     agent.auxiliary_client.call_llm() returns (`.choices[0].message.content`
-    as a plain string) -- identical shape to, and copied from, tools.
-    case_enrichment_analyzer._extract_text (see that function's own
-    docstring). Deliberately not a generic multi-shape parser: any other
-    shape, or a non-string content, returns "" so the caller's empty-
-    response check fails closed rather than silently accepting something
-    unexpected.
+    as a plain string). Any other shape, or a non-string content, returns
+    "" so the caller's empty-response check fails closed rather than
+    silently accepting something unexpected.
     """
     try:
         content = response.choices[0].message.content
@@ -580,60 +381,32 @@ def analyze_reflection_with_llm(
     id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
 ) -> ReflectionResult:
     """The real LLM analyzer: `context` -> one call_llm() invocation ->
-    parse_reflector_output() -> ReflectionResult. The first place in this
-    domain that actually performs semantic reasoning (recurring-pattern
-    identification, improvement_target interpretation, match_existing vs.
-    create_new judgment, trend/possible_cause/confidence) -- Slices 1-5A
-    only assembled evidence and validated shape deterministically.
+    parse_reflector_output() -> ReflectionResult.
 
-    `candidates`/`valid_case_ids` are deliberately NOT separate parameters
-    here, unlike parse_reflector_output()'s own signature: `context.
-    existing_proposals` already IS `tuple[ProposalCandidate, ...]` (see
-    tools.reflector_prompt_context.ReflectorPromptContext's own field type
-    -- confirmed by reading that module before writing this function, not
-    assumed), the exact type validate_proposal_resolution() requires, so
-    passing it straight through is real reuse, not a same-shaped-but-
-    different-semantics conversion. `valid_case_ids` is derived the same
-    way, as `{{c.case_id for c in context.cases}}`. A caller that already
-    has a ReflectorPromptContext therefore never needs to reconstruct or
-    re-pass either collection.
+    `candidates`/`valid_case_ids` are derived from `context` itself
+    (`context.existing_proposals` and `{{c.case_id for c in
+    context.cases}}`) rather than taken as separate parameters, so a
+    caller that already has a ReflectorPromptContext never needs to
+    reconstruct either collection.
 
     `main_runtime` should carry the SAME provider/model/base_url/api_key/
     api_mode the main Hermes agent is already using -- passed straight
-    through to `llm_call`, never resolved or hard-coded in this module
-    (identical contract to tools.case_enrichment_analyzer.
-    analyze_case_with_llm's own `main_runtime` parameter).
+    through to `llm_call`, never resolved or hard-coded here.
 
     `llm_call` defaults to `agent.auxiliary_client.call_llm`, imported here
     (not at module level) so this module stays importable in this repo's
     test environment, which has no Hermes runtime installed -- calling
     without an injected `llm_call` surfaces the resulting ImportError
-    undisguised (not wrapped into ReflectorAnalyzerError, which means "the
-    LLM call itself, or its output, failed" -- a missing package is an
-    environment problem, not that), matching tools.case_enrichment_
-    analyzer.analyze_case_with_llm's own lazy-import contract exactly.
-
-    `id_factory` is forwarded unchanged to parse_reflector_output() -- see
-    that function's own docstring for why one factory is enough.
+    undisguised (not wrapped into ReflectorAnalyzerError, since a missing
+    package is an environment problem, not an LLM/parse failure).
 
     Raises ReflectorAnalyzerError -- never returns None -- for any failure
     downstream of a successful lazy import: provider/network error, empty/
     unreadable response, invalid JSON, or parse_reflector_output()
-    rejecting the decoded response (a fail-closed rejection -- hallucinated
-    proposal_id, hallucinated case_id, invalid taxonomy, invalid
-    confidence, wrong key-set, or an invalid material-change combination
-    -- is reported exactly the same way as any other analyzer failure;
-    this function never retries, never asks the model to "fix" its JSON,
-    and never guesses a closest match on the caller's behalf). No
-    application-level retry anywhere in this function -- `agent.
-    auxiliary_client.call_llm` already retries/falls back at the provider
-    layer, matching tools.case_enrichment_analyzer.analyze_case_with_llm's
-    own "no retry here" contract. No persistence anywhere in this
-    function either: it returns a plain in-memory ReflectionResult, never
-    calls FeedbackStoreV2, and never creates a reflection_runs row -- that
-    stays a future runner's job (Slice 6), exactly like tools.
-    case_enrichment_analyzer.analyze_case_with_llm never calls
-    create_case_analysis().
+    rejecting the decoded response. No application-level retry anywhere in
+    this function; no persistence either (returns a plain in-memory
+    ReflectionResult, never calls FeedbackStoreV2 or creates a
+    reflection_runs row).
     """
     call = llm_call
     if call is None:

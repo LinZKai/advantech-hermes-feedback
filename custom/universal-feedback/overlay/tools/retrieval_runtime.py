@@ -101,7 +101,6 @@ _DEFAULT_CASE_NAMESPACE = uuid.UUID("6f6d9f1a-6e0a-4e6a-9f0a-5a1a2b3c4d5e")
 _REAL_CASE_NAMESPACE = uuid.UUID("6f13814f-df77-4052-985c-48d37e213b7c")
 
 _store_singleton: FeedbackStoreV2 | None = None
-_store_init_failed = False
 
 
 def get_store() -> FeedbackStoreV2 | None:
@@ -112,21 +111,22 @@ def get_store() -> FeedbackStoreV2 | None:
     and tools.feedback_mirror's Phase 3B ones) so the process never opens
     more than one connection pool to the same DB file for this purpose.
 
-    Caches an init failure (rather than retrying on every turn) so a
-    broken DB path does not turn into repeated disk I/O and log noise on
-    every message -- if this needs to change (e.g. hot config reload)
-    that is a later phase's concern.
+    Retries construction on every call until it succeeds -- a transient
+    failure (e.g. the data directory not yet mounted at process start)
+    must never permanently wedge every turn for the rest of this
+    process's lifetime. Every caller already treats a None return as
+    "unavailable this turn" and fails closed (see load_candidate_cases),
+    so retrying is always safe. Logs at warning, not debug, so a real,
+    ongoing failure is visible in normal operation instead of requiring
+    debug-level logging to be enabled to notice it.
     """
-    global _store_singleton, _store_init_failed
+    global _store_singleton
     if _store_singleton is not None:
         return _store_singleton
-    if _store_init_failed:
-        return None
     try:
         _store_singleton = FeedbackStoreV2()
     except Exception:
-        _store_init_failed = True
-        logger.debug("FeedbackStoreV2 init failed", exc_info=True)
+        logger.warning("FeedbackStoreV2 init failed", exc_info=True)
         return None
     return _store_singleton
 
@@ -142,12 +142,11 @@ def load_candidate_cases(
     question": ...]}`` for one Case known to belong to this session,
     oldest first (matches FeedbackStoreV2.list_cases_for_session's own
     ordering). ``first_user_question``/``latest_user_question`` are
-    derived from turns.question_text (the real-time interaction evidence
-    already on the case's turns) -- NOT from cases.title/product_model,
-    which nothing in this codepath writes (see create_case call sites)
-    and which stay reserved for a later Schema Audit decision. Cases
-    Enrichment's case_analysis.case_title is a separate, offline/batch
-    concept and is never read here. ``latest_user_question`` is omitted
+    derived from turns.question_text, the real-time interaction evidence
+    already on the case's turns (``cases`` itself carries no title/product
+    identity columns -- Case Enrichment's case_analysis.case_title is a
+    separate, offline/batch concept and is never read here).
+    ``latest_user_question`` is omitted
     for a Case with only one turn (first and latest would be identical).
     A Case with zero turns yet (a narrow create-then-query race) yields
     an entry with only ``case_id`` -- never fabricated or fetched via a

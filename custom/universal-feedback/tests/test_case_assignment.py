@@ -15,8 +15,7 @@ extension of it: test_retrieval_runtime.py stays untouched as the frozen
 Phase 3A/Stage-A-integration regression baseline (all of it still passes
 unmodified against the Stage B code -- see the Stage B report), and this
 file owns the substantial new Stage B-only test surface, matching the
-one-file-per-concern pattern already used for test_phase3a_wiring.py /
-test_phase3b_wiring.py / test_migration_003.py.
+one-file-per-concern pattern already used elsewhere in this test suite.
 """
 from __future__ import annotations
 
