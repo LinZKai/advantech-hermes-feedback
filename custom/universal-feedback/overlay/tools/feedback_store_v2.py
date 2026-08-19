@@ -1195,6 +1195,31 @@ class FeedbackStoreV2:
                 (session_id,),
             ).fetchall()
 
+    def list_turn_questions_for_cases(self, case_ids: Collection[str]) -> list[sqlite3.Row]:
+        """Return (case_id, question_text, created_at) for every turn whose
+        case_id is one of ``case_ids``, ordered by (case_id, created_at).
+
+        One query for all requested cases (never N+1): a caller can derive
+        each case's first/latest question with a single linear pass over
+        the ordered result. Ordered by created_at for the same reason as
+        every other turns query in this class (list_turns_for_case,
+        list_turns_for_session) -- turns has no separate sequence column,
+        and _now() stamps microsecond-resolution UTC timestamps, so this
+        ordering is reliable within one case's turns. Returns [] for an
+        empty case_ids without issuing a query (an empty SQL IN (...) is
+        invalid).
+        """
+        case_id_list = list(case_ids)
+        if not case_id_list:
+            return []
+        placeholders = ",".join("?" for _ in case_id_list)
+        with self._connect() as db:
+            return db.execute(
+                f"SELECT case_id, question_text, created_at FROM turns "
+                f"WHERE case_id IN ({placeholders}) ORDER BY case_id, created_at",
+                case_id_list,
+            ).fetchall()
+
     def update_turn_retrieval_observation(
         self, turn_id: str, status: str, reason: str | None = None
     ) -> bool:

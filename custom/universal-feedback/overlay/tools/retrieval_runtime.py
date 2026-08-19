@@ -134,32 +134,68 @@ def get_store() -> FeedbackStoreV2 | None:
 def load_candidate_cases(
     session_id: str, *, store: FeedbackStoreV2 | None = None
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Load this session's candidate Cases once, before inference.
+    """Load this session's candidate Cases, plus each one's minimal
+    real-time routing context, once before inference.
 
     Returns ``(candidate_cases, unavailable)``. Each ``candidate_cases``
-    entry is ``{"case_id": ..., "title": ..., "product_model": ...}`` for
-    one Case known to belong to this session, oldest first (matches
-    FeedbackStoreV2.list_cases_for_session's own ordering).
+    entry is ``{"case_id": ..., "first_user_question": ..., ["latest_user_
+    question": ...]}`` for one Case known to belong to this session,
+    oldest first (matches FeedbackStoreV2.list_cases_for_session's own
+    ordering). ``first_user_question``/``latest_user_question`` are
+    derived from turns.question_text (the real-time interaction evidence
+    already on the case's turns) -- NOT from cases.title/product_model,
+    which nothing in this codepath writes (see create_case call sites)
+    and which stay reserved for a later Schema Audit decision. Cases
+    Enrichment's case_analysis.case_title is a separate, offline/batch
+    concept and is never read here. ``latest_user_question`` is omitted
+    for a Case with only one turn (first and latest would be identical).
+    A Case with zero turns yet (a narrow create-then-query race) yields
+    an entry with only ``case_id`` -- never fabricated or fetched via a
+    second query.
 
-    ``unavailable=True`` means the DB lookup itself failed (store
-    unavailable, or list_cases_for_session raised) -- ``candidate_cases``
-    is always ``[]`` in that case, and callers must NEVER read that empty
-    list as "confirmed zero Cases" (see CASE_ASSIGNMENT_METHOD_
-    CANDIDATE_CONTEXT_UNAVAILABLE). Never raises -- fail-closed, matching
-    every other public entry point in this module.
+    ``unavailable=True`` means either DB lookup failed (the cases lookup,
+    or -- once cases are known -- the turn-context lookup) -- store
+    unavailable, or either query raised. ``candidate_cases`` is always
+    ``[]`` in that case, and callers must NEVER read that empty list as
+    "confirmed zero Cases" (see CASE_ASSIGNMENT_METHOD_
+    CANDIDATE_CONTEXT_UNAVAILABLE): a turn-context lookup failure is a
+    lookup failure, not evidence the session has no Cases, and must not
+    be conflated with the "genuinely zero Cases" case (which still
+    returns ``([], False)``). Never raises -- fail-closed, matching every
+    other public entry point in this module.
     """
     active_store = store if store is not None else get_store()
     if active_store is None:
         return [], True
     try:
-        rows = active_store.list_cases_for_session(session_id)
+        case_rows = active_store.list_cases_for_session(session_id)
     except Exception:
         logger.debug("Phase 4 candidate case lookup failed", exc_info=True)
         return [], True
-    return [
-        {"case_id": str(row["case_id"]), "title": row["title"], "product_model": row["product_model"]}
-        for row in rows
-    ], False
+    if not case_rows:
+        return [], False
+
+    case_ids = [str(row["case_id"]) for row in case_rows]
+    try:
+        turn_rows = active_store.list_turn_questions_for_cases(case_ids)
+    except Exception:
+        logger.debug("Phase 4 candidate turn-context lookup failed", exc_info=True)
+        return [], True
+
+    questions_by_case: dict[str, list[str]] = {}
+    for turn_row in turn_rows:
+        questions_by_case.setdefault(str(turn_row["case_id"]), []).append(turn_row["question_text"])
+
+    candidates: list[dict[str, Any]] = []
+    for case_id in case_ids:
+        questions = questions_by_case.get(case_id, [])
+        candidate: dict[str, Any] = {"case_id": case_id}
+        if questions:
+            candidate["first_user_question"] = questions[0]
+            if len(questions) > 1:
+                candidate["latest_user_question"] = questions[-1]
+        candidates.append(candidate)
+    return candidates, False
 
 
 def build_case_routing_prompt(candidate_cases: Sequence[Mapping[str, Any]]) -> str:
@@ -170,18 +206,21 @@ def build_case_routing_prompt(candidate_cases: Sequence[Mapping[str, Any]]) -> s
     ``candidate_cases`` is confirmed non-empty (see the Phase 4A Stage C
     plan, sections 2/4) -- an empty-candidate or lookup-unavailable turn
     never gets this prompt at all, so there is nothing for the model to
-    route against and no envelope is requested. Lists only case_id/title/
-    product_model per candidate -- deliberately never turn transcripts,
-    feedback, retrieval runs, or full previous answers; the model already
-    has normal conversation context, this is routing aid only.
+    route against and no envelope is requested. Lists only case_id/
+    first_user_question/latest_user_question per candidate -- a minimal
+    semantic anchor derived from turns.question_text so a case_id is
+    never just a bare UUID -- deliberately never full turn transcripts,
+    assistant answers, feedback, retrieval runs, or case_analysis; the
+    model already has normal conversation context, this is routing aid
+    only.
     """
     lines = ["Current session Case routing context:", "", "Known cases:"]
     for case in candidate_cases:
         lines.append(f"- case_id: {case['case_id']}")
-        if case.get("title"):
-            lines.append(f"  title: {case['title']}")
-        if case.get("product_model"):
-            lines.append(f"  product_model: {case['product_model']}")
+        if case.get("first_user_question"):
+            lines.append(f"  first_user_question: {case['first_user_question']}")
+        if case.get("latest_user_question"):
+            lines.append(f"  latest_user_question: {case['latest_user_question']}")
     lines += [
         "",
         "For the final user-facing assistant response only, emit exactly "
@@ -205,6 +244,10 @@ def build_case_routing_prompt(candidate_cases: Sequence[Mapping[str, Any]]) -> s
         "- A new topic sentence from the user is NOT automatically a new "
         "Case -- consider whether it is still part of the same underlying "
         'issue as an existing case above before deciding "new".',
+        "- Same product/topic/category does not by itself mean the same "
+        'Case. "existing" means the new Turn is still working toward '
+        "resolving the same primary technical issue represented by that "
+        "Case, not merely a similar topic or the same product.",
         "- Never invent a case_id that is not listed above.",
         "- Never emit the envelope in a response that also contains a "
         "tool call.",

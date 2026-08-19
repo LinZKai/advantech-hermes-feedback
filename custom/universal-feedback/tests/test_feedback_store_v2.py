@@ -195,6 +195,25 @@ class SessionCaseTurnTests(_V2StoreTestCase):
         by_session = self.store.list_turns_for_session(session_id)
         self.assertEqual({t["turn_id"] for t in by_session}, {"turn-a", "turn-b"})
 
+    def test_list_turn_questions_for_cases_orders_by_case_then_created_at(self):
+        session_id = self._new_session()
+        case_a = self._new_case("case-a", session_id)
+        case_b = self._new_case("case-b", session_id)
+        self._new_turn("turn-a1", case_a, platform_user_message_id="m-a1", question_text="a first")
+        self._new_turn("turn-a2", case_a, platform_user_message_id="m-a2", question_text="a second")
+        self._new_turn("turn-b1", case_b, platform_user_message_id="m-b1", question_text="b first")
+
+        rows = self.store.list_turn_questions_for_cases([case_a, case_b])
+        by_case: dict[str, list[str]] = {}
+        for row in rows:
+            by_case.setdefault(row["case_id"], []).append(row["question_text"])
+
+        self.assertEqual(by_case[case_a], ["a first", "a second"])
+        self.assertEqual(by_case[case_b], ["b first"])
+
+    def test_list_turn_questions_for_cases_empty_input_returns_empty_without_query(self):
+        self.assertEqual(self.store.list_turn_questions_for_cases([]), [])
+
     def test_turn_session_id_is_derived_from_case_not_caller(self):
         session_id = self._new_session()
         case_id = self._new_case(session_id=session_id)

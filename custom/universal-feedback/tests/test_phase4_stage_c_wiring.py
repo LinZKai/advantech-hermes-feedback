@@ -96,10 +96,22 @@ class _StoreTestCase(unittest.TestCase):
         gc.collect()
         self._tmpdir.cleanup()
 
-    def _seed_case(self, case_id, session_id, *, title=None, product_model=None):
+    def _seed_case(self, case_id, session_id):
         self.store.create_or_update_session(session_id, "telegram")
-        self.store.create_case(case_id, session_id, title=title, product_model=product_model)
+        self.store.create_case(case_id, session_id)
         return case_id
+
+    def _seed_turn(self, turn_id, case_id, question_text, *, platform_user_message_id=None):
+        self.store.create_turn(
+            turn_id,
+            case_id,
+            platform_user_id="user-1",
+            platform_user_message_id=platform_user_message_id or f"msg-{turn_id}",
+            question_text=question_text,
+            answer_text="answer",
+            feedback_eligible=True,
+        )
+        return turn_id
 
 
 class _ExplodingStore:
@@ -109,6 +121,23 @@ class _ExplodingStore:
         return _boom
 
 
+class _TurnContextExplodingStore:
+    """Delegates the cases lookup to a real store but always raises on the
+    turn-context lookup -- used to verify that a turn-context failure
+    (candidate Cases found, but their routing context could not be
+    fetched) is treated as unavailable, never silently downgraded to
+    "confirmed zero candidates"."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def list_cases_for_session(self, session_id):
+        return self._store.list_cases_for_session(session_id)
+
+    def list_turn_questions_for_cases(self, case_ids):
+        raise RuntimeError("simulated turn-context lookup failure")
+
+
 class CandidateLoadingTests(_StoreTestCase):
     def test_candidate_query_returns_empty(self):
         self.store.create_or_update_session("sess-1", "telegram")
@@ -116,14 +145,49 @@ class CandidateLoadingTests(_StoreTestCase):
         self.assertEqual(candidates, [])
         self.assertFalse(unavailable)
 
-    def test_candidate_query_returns_one_case(self):
-        self._seed_case("case-a", "sess-1", title="ADAM-6266 — SNMP", product_model="ADAM-6266")
+    def test_single_turn_case_has_first_but_no_latest(self):
+        self._seed_case("case-a", "sess-1")
+        self._seed_turn("turn-1", "case-a", "ADAM-6266 要怎麼關閉 SNMP？")
         candidates, unavailable = load_candidate_cases("sess-1", store=self.store)
         self.assertFalse(unavailable)
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["case_id"], "case-a")
-        self.assertEqual(candidates[0]["title"], "ADAM-6266 — SNMP")
-        self.assertEqual(candidates[0]["product_model"], "ADAM-6266")
+        self.assertEqual(candidates[0]["first_user_question"], "ADAM-6266 要怎麼關閉 SNMP？")
+        self.assertNotIn("latest_user_question", candidates[0])
+
+    def test_multi_turn_case_has_first_and_latest_only(self):
+        self._seed_case("case-a", "sess-1")
+        self._seed_turn("turn-1", "case-a", "ADAM-6717 Node-RED crash 後 Web GUI 打不開")
+        self._seed_turn("turn-2", "case-a", "怎麼用 SSH 看 error？")
+        self._seed_turn("turn-3", "case-a", "看到 EADDRINUSE:502，接下來怎麼辦？")
+        candidates, unavailable = load_candidate_cases("sess-1", store=self.store)
+        self.assertFalse(unavailable)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["first_user_question"], "ADAM-6717 Node-RED crash 後 Web GUI 打不開")
+        self.assertEqual(candidates[0]["latest_user_question"], "看到 EADDRINUSE:502，接下來怎麼辦？")
+        # the middle turn's question must never leak into the candidate context
+        for value in candidates[0].values():
+            self.assertNotIn("SSH", value)
+
+    def test_multiple_cases_do_not_cross_contaminate(self):
+        self._seed_case("case-a", "sess-1")
+        self._seed_case("case-b", "sess-1")
+        self._seed_turn("turn-a1", "case-a", "兩台 BB-USR604 Serial Number 相同造成衝突，要怎麼處理？")
+        self._seed_turn("turn-b1", "case-b", "ADAM-6266 要怎麼關閉 SNMP？")
+        self._seed_turn("turn-b2", "case-b", "ADAM-6266 是否能限制 SNMP GET/SET 的來源 IP？")
+        candidates, unavailable = load_candidate_cases("sess-1", store=self.store)
+        self.assertFalse(unavailable)
+        by_id = {c["case_id"]: c for c in candidates}
+        self.assertEqual(
+            by_id["case-a"]["first_user_question"],
+            "兩台 BB-USR604 Serial Number 相同造成衝突，要怎麼處理？",
+        )
+        self.assertNotIn("latest_user_question", by_id["case-a"])
+        self.assertEqual(by_id["case-b"]["first_user_question"], "ADAM-6266 要怎麼關閉 SNMP？")
+        self.assertEqual(
+            by_id["case-b"]["latest_user_question"],
+            "ADAM-6266 是否能限制 SNMP GET/SET 的來源 IP？",
+        )
 
     def test_candidate_query_returns_multiple_cases(self):
         self._seed_case("case-a", "sess-1")
@@ -147,37 +211,96 @@ class CandidateLoadingTests(_StoreTestCase):
         self.assertEqual(candidates, [])
         self.assertTrue(unavailable)
 
+    def test_turn_context_query_failure_is_unavailable_not_empty(self):
+        self._seed_case("case-a", "sess-1")
+        self._seed_turn("turn-1", "case-a", "ADAM-6266 要怎麼關閉 SNMP？")
+        candidates, unavailable = load_candidate_cases(
+            "sess-1", store=_TurnContextExplodingStore(self.store)
+        )
+        self.assertEqual(candidates, [])
+        self.assertTrue(unavailable)
+
 
 class CaseRoutingPromptTests(unittest.TestCase):
     def test_prompt_lists_all_candidate_ids(self):
         candidates = [
-            {"case_id": "case-a", "title": "ADAM-6266 — SNMP", "product_model": "ADAM-6266"},
-            {"case_id": "case-b", "title": "WISE-6610 — LTE", "product_model": "WISE-6610"},
+            {"case_id": "case-a", "first_user_question": "ADAM-6266 要怎麼關閉 SNMP？"},
+            {"case_id": "case-b", "first_user_question": "WISE-6610 LTE 訊號很弱怎麼辦？"},
         ]
         prompt = build_case_routing_prompt(candidates)
         self.assertIn("case-a", prompt)
         self.assertIn("case-b", prompt)
-        self.assertIn("ADAM-6266 — SNMP", prompt)
-        self.assertIn("WISE-6610", prompt)
+        self.assertIn("ADAM-6266 要怎麼關閉 SNMP？", prompt)
+        self.assertIn("WISE-6610 LTE 訊號很弱怎麼辦？", prompt)
+
+    def test_prompt_includes_latest_only_when_present(self):
+        candidates = [
+            {"case_id": "case-a", "first_user_question": "first only"},
+            {
+                "case_id": "case-b",
+                "first_user_question": "first q",
+                "latest_user_question": "latest q",
+            },
+        ]
+        prompt = build_case_routing_prompt(candidates)
+        self.assertIn("first only", prompt)
+        self.assertNotIn("latest_user_question: first only", prompt)
+        self.assertIn("latest_user_question: latest q", prompt)
 
     def test_prompt_uses_protocol_delimiters_and_version(self):
-        prompt = build_case_routing_prompt([{"case_id": "case-a", "title": None, "product_model": None}])
+        prompt = build_case_routing_prompt([{"case_id": "case-a"}])
         self.assertIn(CASE_ROUTING_OPEN_DELIM, prompt)
         self.assertIn(CASE_ROUTING_CLOSE_DELIM, prompt)
         self.assertIn(ROUTING_VERSION, prompt)
 
     def test_prompt_final_response_only_and_no_tool_call_rule(self):
-        prompt = build_case_routing_prompt([{"case_id": "case-a", "title": None, "product_model": None}])
+        prompt = build_case_routing_prompt([{"case_id": "case-a"}])
         self.assertIn("final user-facing assistant response only", prompt)
         self.assertIn("tool call", prompt)
 
+    def test_prompt_has_same_product_topic_not_same_case_rule(self):
+        prompt = build_case_routing_prompt([{"case_id": "case-a"}])
+        self.assertIn("Same product/topic/category does not by itself mean the same Case", prompt)
+
     def test_prompt_does_not_leak_forbidden_content_categories(self):
-        # Only case_id/title/product_model may appear -- never anything
-        # resembling turn transcripts, feedback, or retrieval telemetry.
-        candidates = [{"case_id": "case-a", "title": "t", "product_model": "m"}]
+        # Only case_id/first_user_question/latest_user_question may appear
+        # -- never anything resembling assistant answers, feedback, or
+        # retrieval telemetry.
+        candidates = [
+            {"case_id": "case-a", "first_user_question": "q1", "latest_user_question": "q2"}
+        ]
         prompt = build_case_routing_prompt(candidates)
-        for forbidden in ("feedback", "retrieval_run", "answer_text", "question_text"):
+        for forbidden in ("feedback", "retrieval_run", "answer_text"):
             self.assertNotIn(forbidden, prompt.lower())
+
+    def test_prompt_never_reduces_existing_case_to_bare_case_id(self):
+        # Core regression: BB-USR604 (Case A) vs ADAM-6266 SNMP (Case B) --
+        # the model must be able to tell them apart from the prompt text
+        # alone, not just see two indistinguishable UUIDs.
+        candidates = [
+            {
+                "case_id": "11111111-1111-1111-1111-111111111111",
+                "first_user_question": "兩台 BB-USR604 接同一台電腦，Serial Number 相同造成辨識衝突，要怎麼處理？",
+            },
+            {
+                "case_id": "22222222-2222-2222-2222-222222222222",
+                "first_user_question": "ADAM-6266 要怎麼關閉 SNMP？",
+            },
+        ]
+        prompt = build_case_routing_prompt(candidates)
+        self.assertIn("BB-USR604", prompt)
+        self.assertIn("Serial Number", prompt)
+        self.assertIn("ADAM-6266", prompt)
+        self.assertIn("SNMP", prompt)
+        # each candidate's evidence must be scoped to its own case_id block,
+        # not merged into one undifferentiated blob
+        case_a_idx = prompt.index("11111111-1111-1111-1111-111111111111")
+        case_b_idx = prompt.index("22222222-2222-2222-2222-222222222222")
+        bb_usr604_idx = prompt.index("BB-USR604")
+        snmp_idx = prompt.index("ADAM-6266 要怎麼關閉 SNMP")
+        self.assertLess(case_a_idx, bb_usr604_idx)
+        self.assertLess(bb_usr604_idx, case_b_idx)
+        self.assertLess(case_b_idx, snmp_idx)
 
 
 # ---------------------------------------------------------------------------
