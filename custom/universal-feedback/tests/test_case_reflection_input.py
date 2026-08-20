@@ -38,6 +38,7 @@ from tools.case_reflection_input import (  # noqa: E402
     UNKNOWN_PRODUCT_MODEL_BUCKET,
     CaseIntelligenceRecord,
     ReflectorInput,
+    build_case_intelligence_for_ids,
     build_reflector_input,
     is_reflection_eligible,
 )
@@ -644,6 +645,70 @@ class ReflectionEligibilityTests(_StoreTestCase):
     def test_default_threshold_rejects_four(self):
         reflector_input = self._input_with_analyzed(4)
         self.assertFalse(is_reflection_eligible(reflector_input))
+
+
+# ---------------------------------------------------------------------------
+# Curator Slice 1 -- build_case_intelligence_for_ids (the case_id-scoped
+# counterpart to build_reflector_input(), used by tools.run_curator)
+# ---------------------------------------------------------------------------
+
+
+class BuildCaseIntelligenceForIdsTests(_StoreTestCase):
+    def test_empty_case_ids_returns_empty_without_querying(self):
+        records, unusable = build_case_intelligence_for_ids(self.store, [])
+        self.assertEqual(records, ())
+        self.assertEqual(unusable, ())
+
+    def test_resolves_only_the_given_case_ids(self):
+        self._seed_case("case-a", created_at="2026-01-01T00:00:00+00:00")
+        self._seed_case("case-b", created_at="2026-01-01T00:00:00+00:00")
+        self._create_analysis("case-a", analyzed_at="2026-01-02T00:00:00+00:00")
+        self._create_analysis("case-b", analyzed_at="2026-01-02T00:00:00+00:00")
+
+        records, unusable = build_case_intelligence_for_ids(self.store, ["case-a"])
+
+        self.assertEqual([r.case_id for r in records], ["case-a"])
+        self.assertEqual(unusable, ())
+
+    def test_case_with_no_analysis_is_reported_unusable(self):
+        self._seed_case("case-a", created_at="2026-01-01T00:00:00+00:00")
+        # No case_analysis row created for case-a.
+        records, unusable = build_case_intelligence_for_ids(self.store, ["case-a"])
+        self.assertEqual(records, ())
+        self.assertEqual(unusable, ("case-a",))
+
+    def test_case_id_with_no_case_at_all_is_reported_unusable(self):
+        records, unusable = build_case_intelligence_for_ids(self.store, ["case-does-not-exist"])
+        self.assertEqual(records, ())
+        self.assertEqual(unusable, ("case-does-not-exist",))
+
+    def test_unparseable_evidence_json_is_reported_unusable_not_dropped_silently(self):
+        self._seed_case("case-a", created_at="2026-01-01T00:00:00+00:00")
+        self._create_analysis("case-a", analyzed_at="2026-01-02T00:00:00+00:00", evidence_json="not valid json")
+        records, unusable = build_case_intelligence_for_ids(self.store, ["case-a"])
+        self.assertEqual(records, ())
+        self.assertEqual(unusable, ("case-a",))
+
+    def test_ordering_is_case_id_ascending_regardless_of_input_order(self):
+        for case_id in ("case-c", "case-a", "case-b"):
+            self._seed_case(case_id, created_at="2026-01-01T00:00:00+00:00")
+            self._create_analysis(case_id, analyzed_at="2026-01-02T00:00:00+00:00")
+
+        records, _ = build_case_intelligence_for_ids(self.store, ["case-c", "case-a", "case-b"])
+        self.assertEqual([r.case_id for r in records], ["case-a", "case-b", "case-c"])
+
+    def test_reuses_evidence_json_parsing_from_reflector_input(self):
+        self._seed_case("case-a", created_at="2026-01-01T00:00:00+00:00")
+        evidence_json = json.dumps([{"type": "user_text", "turn_id": "t1", "fact": "SNMP disable asked"}])
+        self._create_analysis("case-a", analyzed_at="2026-01-02T00:00:00+00:00", evidence_json=evidence_json)
+
+        records, unusable = build_case_intelligence_for_ids(self.store, ["case-a"])
+
+        self.assertEqual(unusable, ())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(records[0].evidence), 1)
+        self.assertIsInstance(records[0].evidence[0], CaseAnalysisEvidence)
+        self.assertEqual(records[0].evidence[0].fact, "SNMP disable asked")
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ import json
 import logging
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Collection, Mapping
 
 from tools._validation import is_valid_confidence as _is_valid_confidence
 from tools._validation import require_nonblank_str as _require_nonblank_str
@@ -482,6 +482,61 @@ def build_reflector_input(
 
 
 # ---------------------------------------------------------------------------
+# Case-id-scoped assembly -- the Curator's own entry point into this same
+# case_analysis row -> CaseIntelligenceRecord reconstruction (Curator
+# Slice 1). Deliberately separate from build_reflector_input() above: a
+# Curator run resolves ONE Proposal's/Observation's explicit, already-known
+# supporting_case_ids, never a Case-creation-time window.
+# ---------------------------------------------------------------------------
+
+
+def build_case_intelligence_for_ids(
+    store: FeedbackStoreV2, case_ids: Collection[str],
+) -> tuple[tuple[CaseIntelligenceRecord, ...], tuple[str, ...]]:
+    """Reconstruct CaseIntelligenceRecord for an explicit, caller-supplied
+    collection of case_ids (e.g. one ImprovementProposal Observation's
+    supporting_case_ids) -- the case_id-scoped counterpart to
+    build_reflector_input()'s window-scoped assembly. Reuses the exact same
+    case_analysis row -> CaseIntelligenceRecord reconstruction
+    (_build_case_intelligence_record) so evidence_json parsing/validation
+    is never duplicated between the two callers.
+
+    case_ids=() returns ((), ()) without querying the store, matching
+    FeedbackStoreV2.list_latest_case_analysis()'s own empty-collection
+    contract (an empty collection is explicit input, not "no filter").
+
+    Returns (records, unusable_case_ids). `records` holds every case_id
+    that reconstructed successfully, ordered case_id ascending (same
+    ordering convention as build_reflector_input()). `unusable_case_ids`
+    (sorted, deduplicated) holds every given case_id that has no
+    case_analysis row at all, OR whose latest row failed to reconstruct --
+    unlike ReflectorInput, this function does not split those two reasons
+    into separate fields: a caller consuming one small, explicit case_id
+    list only needs to know which ones it cannot use, not a window-level
+    coverage/health breakdown.
+    """
+    ids = list(case_ids)
+    if not ids:
+        return (), ()
+
+    rows = store.list_latest_case_analysis(case_ids=ids)
+    found_case_ids: set[str] = set()
+    records: list[CaseIntelligenceRecord] = []
+    unusable: list[str] = []
+    for row in rows:
+        found_case_ids.add(row["case_id"])
+        record = _build_case_intelligence_record(row)
+        if record is None:
+            unusable.append(row["case_id"])
+        else:
+            records.append(record)
+
+    unusable.extend(cid for cid in ids if cid not in found_case_ids)
+    records.sort(key=lambda r: r.case_id)
+    return tuple(records), tuple(sorted(set(unusable)))
+
+
+# ---------------------------------------------------------------------------
 # Reflection eligibility -- orchestration POLICY, deliberately separate from
 # the ReflectorInput data contract above (see this module's docstring)
 # ---------------------------------------------------------------------------
@@ -530,5 +585,6 @@ __all__ = [
     "CaseIntelligenceRecord",
     "ReflectorInput",
     "build_reflector_input",
+    "build_case_intelligence_for_ids",
     "is_reflection_eligible",
 ]

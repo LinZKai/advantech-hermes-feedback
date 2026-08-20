@@ -192,6 +192,46 @@ REFLECTION_RUN_STATUS_VALUES: tuple[str, ...] = (
 _REFLECTION_RUN_STATUS_VALUE_SET = frozenset(REFLECTION_RUN_STATUS_VALUES)
 _REFLECTION_RUN_TERMINAL_STATUS_VALUE_SET = frozenset({"succeeded", "failed"})
 
+# Curator Slice 1 taxonomies -- same "kept in sync with the CHECK
+# constraints in _SCHEMA_STATEMENTS below, fail-closed-in-Python-first"
+# convention as every taxonomy above. tools.curator_domain imports both
+# from here rather than maintaining its own copies.
+#
+# change_type: what KIND of edit a CuratorChange proposes against
+# target_file (always /sandbox/AGENTS.md in this slice -- see
+# tools.curator_domain.CURATOR_TARGET_FILE).
+#
+#   add_rule                - target_file does not yet address the
+#                              pattern; new instruction content is added.
+#   modify_rule              - an existing rule needs to change.
+#   remove_rule               - an existing rule is itself the problem and
+#                              should be removed.
+#   no_change_recommended    - target_file is judged not to be an
+#                              appropriate lever for this Proposal; a fully
+#                              legitimate outcome, not a failure.
+CHANGE_TYPE_VALUES: tuple[str, ...] = (
+    "add_rule",
+    "modify_rule",
+    "remove_rule",
+    "no_change_recommended",
+)
+_CHANGE_TYPE_VALUE_SET = frozenset(CHANGE_TYPE_VALUES)
+
+# status: a curator_changes row's own review/apply lifecycle.
+# create_curator_change() only ever inserts 'proposed' -- moving a row to
+# 'approved'/'rejected' (human review) or 'applied'/'failed' (a future
+# apply step) is explicitly OUT OF SCOPE for this slice and is not
+# implemented by any function in this module or in tools.curator_domain/
+# tools.curator_analyzer/tools.run_curator.
+CURATOR_CHANGE_STATUS_VALUES: tuple[str, ...] = (
+    "proposed",
+    "approved",
+    "rejected",
+    "applied",
+    "failed",
+)
+_CURATOR_CHANGE_STATUS_VALUE_SET = frozenset(CURATOR_CHANGE_STATUS_VALUES)
+
 
 # Fixed, safe reason stored on turns.retrieval_observation_reason when a
 # retrieval-insert batch fails and is rolled back -- never the underlying
@@ -514,6 +554,47 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_proposal_observations_proposal ON proposal_observations(proposal_id)",
     "CREATE INDEX IF NOT EXISTS idx_proposal_observations_run ON proposal_observations(reflection_run_id)",
+    # curator_changes: Curator Slice 1. One row per Curator run against one
+    # accepted, agent_behavior improvement_proposals row -- NOT append-only
+    # in the same sense as case_analysis/proposal_observations (a re-run
+    # against the same proposal_id simply creates ANOTHER row; nothing
+    # updates proposed_content in place), but status IS mutable: proposed
+    # -> approved/rejected -> applied/failed is a future review/apply
+    # step's job, not built in this slice -- create_curator_change() only
+    # ever inserts status='proposed', reviewed_at=NULL, applied_at=NULL.
+    # proposed_content is nullable: NULL exactly when
+    # change_type='no_change_recommended' (see tools.curator_domain.
+    # CuratorChange's own cross-field rule -- not re-expressed as a SQL
+    # CHECK here, matching this module's existing convention of leaving
+    # cross-field consistency to the dataclass/Python-validation layer).
+    """
+    CREATE TABLE IF NOT EXISTS curator_changes (
+        change_id TEXT PRIMARY KEY,
+
+        proposal_id TEXT NOT NULL REFERENCES improvement_proposals(proposal_id),
+        target_file TEXT NOT NULL,
+
+        change_type TEXT NOT NULL CHECK (change_type IN (
+            'add_rule', 'modify_rule', 'remove_rule', 'no_change_recommended'
+        )),
+
+        rationale        TEXT NOT NULL,
+        before_content   TEXT NOT NULL,
+        proposed_content TEXT,
+        expected_effect  TEXT,
+
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+
+        status TEXT NOT NULL CHECK (status IN (
+            'proposed', 'approved', 'rejected', 'applied', 'failed'
+        )),
+
+        created_at  TEXT NOT NULL,
+        reviewed_at TEXT,
+        applied_at  TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_curator_changes_proposal ON curator_changes(proposal_id)",
 )
 
 def _now() -> str:
@@ -1794,6 +1875,90 @@ class FeedbackStoreV2:
             return True
         finally:
             db.close()
+
+    # -- curator changes (Curator Slice 1) -------------------------------
+
+    def create_curator_change(
+        self,
+        change_id: str,
+        proposal_id: str,
+        target_file: str,
+        *,
+        change_type: str,
+        rationale: str,
+        before_content: str,
+        proposed_content: str | None,
+        expected_effect: str | None,
+        confidence: float,
+        created_at: str,
+    ) -> bool:
+        """Create one curator_changes row with status='proposed' -- the
+        only legal initial status (never caller-supplied, same "only one
+        legal initial value" reasoning as create_improvement_proposal()'s
+        review_status='pending' and create_reflection_run()'s
+        status='running'). reviewed_at/applied_at are NULL at creation --
+        a future review/apply step (not built in this slice) is the only
+        thing that would ever set either.
+
+        Re-validates every primitive value in Python before attempting the
+        INSERT (fail closed, matching this module's other create_*
+        methods). proposed_content is required (non-blank) when
+        change_type is 'add_rule'/'modify_rule'/'remove_rule', and must be
+        None when change_type='no_change_recommended' -- mirrors
+        tools.curator_domain.CuratorChange's own cross-field rule at this
+        storage boundary too (defense-in-depth, never assumed to have
+        already run by the time a row reaches this method).
+
+        Returns False, never raises, for: an invalid change_type, an
+        invalid confidence, a blank rationale/before_content, a
+        proposed_content/change_type mismatch, a non-blank expected_effect
+        given as something other than a string, an unknown proposal_id
+        (FK violation), or a duplicate change_id (PRIMARY KEY violation).
+        """
+        if change_type not in _CHANGE_TYPE_VALUE_SET:
+            return False
+        if not isinstance(rationale, str) or not rationale.strip():
+            return False
+        if not isinstance(before_content, str) or not before_content.strip():
+            return False
+        if change_type == "no_change_recommended":
+            if proposed_content is not None:
+                return False
+        else:
+            if not isinstance(proposed_content, str) or not proposed_content.strip():
+                return False
+        if expected_effect is not None and (
+            not isinstance(expected_effect, str) or not expected_effect.strip()
+        ):
+            return False
+        if not _is_valid_confidence(confidence):
+            return False
+
+        with self._connect() as db:
+            try:
+                db.execute(
+                    """
+                    INSERT INTO curator_changes (
+                        change_id, proposal_id, target_file, change_type, rationale,
+                        before_content, proposed_content, expected_effect, confidence,
+                        status, created_at, reviewed_at, applied_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, NULL, NULL)
+                    """,
+                    (
+                        str(change_id), str(proposal_id), str(target_file), change_type, rationale,
+                        before_content, proposed_content, expected_effect, confidence,
+                        str(created_at),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def get_curator_change(self, change_id: str) -> sqlite3.Row | None:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM curator_changes WHERE change_id=?", (change_id,)
+            ).fetchone()
 
 
 __all__ = [
