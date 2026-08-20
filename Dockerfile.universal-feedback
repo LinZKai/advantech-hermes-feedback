@@ -603,6 +603,19 @@ RUN if [ "$NEMOCLAW_DARWIN_VM_COMPAT" = "1" ]; then \
 # These files are baked into the image instead of modifying /opt/hermes
 # from the running sandbox.
 
+# Dashboard MVP API (tools/dashboard_api) is a FastAPI app -- neither
+# FastAPI nor its ASGI server (Uvicorn) ship with the base Hermes image,
+# so they are installed explicitly into the existing /opt/hermes/.venv
+# (no separate venv, no requirements.txt/pyproject.toml for this overlay
+# -- this repo has no existing Python dependency-manifest convention to
+# extend, so a direct pip install here is the smallest addition). Pinned
+# to major-version ranges only, matching this Dockerfile's general
+# preference for explicit, reviewable version bounds over an unpinned
+# install.
+RUN /opt/hermes/.venv/bin/python -m pip install --no-cache-dir \
+        "fastapi>=0.115,<1" \
+        "uvicorn>=0.30,<1"
+
 COPY custom/universal-feedback/overlay/gateway/run.py \
     /opt/hermes/gateway/run.py
 
@@ -684,6 +697,18 @@ COPY custom/universal-feedback/overlay/tools/run_curator.py \
 COPY custom/universal-feedback/overlay/tools/review_proposal.py \
     /opt/hermes/tools/review_proposal.py
 
+COPY custom/universal-feedback/overlay/tools/review_curator_change.py \
+    /opt/hermes/tools/review_curator_change.py
+
+COPY custom/universal-feedback/overlay/tools/apply_curator_change.py \
+    /opt/hermes/tools/apply_curator_change.py
+
+COPY custom/universal-feedback/overlay/dashboard_api/views.py \
+    /opt/hermes/dashboard_api/views.py
+
+COPY custom/universal-feedback/overlay/dashboard_api/app.py \
+    /opt/hermes/dashboard_api/app.py
+
 RUN mkdir -p /opt/hermes/migrations
 
 COPY custom/universal-feedback/overlay/migrations/001_universal_feedback.sql \
@@ -735,6 +760,10 @@ RUN set -eu; \
         /opt/hermes/tools/curator_analyzer.py \
         /opt/hermes/tools/run_curator.py \
         /opt/hermes/tools/review_proposal.py \
+        /opt/hermes/tools/review_curator_change.py \
+        /opt/hermes/tools/apply_curator_change.py \
+        /opt/hermes/dashboard_api/views.py \
+        /opt/hermes/dashboard_api/app.py \
         /opt/hermes/migrations/001_universal_feedback.sql \
         /opt/hermes/migrations/002_feedback_schema_v2.sql \
         /opt/hermes/migrations/003_retrieval_execution_statuses.sql \
@@ -769,9 +798,13 @@ RUN set -eu; \
         /opt/hermes/tools/curator_prompt_context.py \
         /opt/hermes/tools/curator_analyzer.py \
         /opt/hermes/tools/run_curator.py \
-        /opt/hermes/tools/review_proposal.py; \
+        /opt/hermes/tools/review_proposal.py \
+        /opt/hermes/tools/review_curator_change.py \
+        /opt/hermes/tools/apply_curator_change.py \
+        /opt/hermes/dashboard_api/views.py \
+        /opt/hermes/dashboard_api/app.py; \
     /opt/hermes/.venv/bin/python -c \
-        'import tools._validation, tools.feedback_store_v2, tools.retrieval_observer, tools.retrieval_runtime, tools.case_routing, tools.feedback_mirror, tools.case_enrichment, tools.case_enrichment_analyzer, tools.run_case_enrichment, tools.case_reflection_input, tools.reflector_proposals, tools.proposal_matching, tools.reflector_prompt_context, tools.reflector_analyzer, tools.reflector_persistence, tools.run_reflector, tools.curator_domain, tools.curator_prompt_context, tools.curator_analyzer, tools.run_curator, tools.review_proposal'
+        'import tools._validation, tools.feedback_store_v2, tools.retrieval_observer, tools.retrieval_runtime, tools.case_routing, tools.feedback_mirror, tools.case_enrichment, tools.case_enrichment_analyzer, tools.run_case_enrichment, tools.case_reflection_input, tools.reflector_proposals, tools.proposal_matching, tools.reflector_prompt_context, tools.reflector_analyzer, tools.reflector_persistence, tools.run_reflector, tools.curator_domain, tools.curator_prompt_context, tools.curator_analyzer, tools.run_curator, tools.review_proposal, tools.review_curator_change, tools.apply_curator_change, dashboard_api.views, dashboard_api.app'
 
 # END ADVANTECH UNIVERSAL FEEDBACK
 

@@ -206,5 +206,122 @@ class CreateCuratorChangeValidationTests(_StoreTestCase):
         self.assertFalse(ok)
 
 
+# ---------------------------------------------------------------------------
+# 4. Curator Slice 2 -- review_curator_change / mark_curator_change_applied /
+#    mark_curator_change_failed state-machine transitions
+# ---------------------------------------------------------------------------
+
+
+class ReviewCuratorChangeTests(_StoreTestCase):
+    def test_proposed_to_approved_succeeds(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        ok = self.store.review_curator_change(change_id, "approved", reviewed_at="2026-01-03T00:00:00+00:00")
+        self.assertTrue(ok)
+        row = self.store.get_curator_change(change_id)
+        self.assertEqual(row["status"], "approved")
+        self.assertEqual(row["reviewed_at"], "2026-01-03T00:00:00+00:00")
+
+    def test_proposed_to_rejected_succeeds(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        ok = self.store.review_curator_change(change_id, "rejected", reviewed_at="2026-01-03T00:00:00+00:00")
+        self.assertTrue(ok)
+        self.assertEqual(self.store.get_curator_change(change_id)["status"], "rejected")
+
+    def test_invalid_status_value_rejected(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        ok = self.store.review_curator_change(change_id, "applied", reviewed_at="2026-01-03T00:00:00+00:00")
+        self.assertFalse(ok)
+        self.assertEqual(self.store.get_curator_change(change_id)["status"], "proposed")
+
+    def test_rejected_to_approved_fails(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        self.store.review_curator_change(change_id, "rejected", reviewed_at="2026-01-03T00:00:00+00:00")
+        ok = self.store.review_curator_change(change_id, "approved", reviewed_at="2026-01-04T00:00:00+00:00")
+        self.assertFalse(ok)
+        self.assertEqual(self.store.get_curator_change(change_id)["status"], "rejected")
+
+    def test_approved_to_rejected_fails(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        self.store.review_curator_change(change_id, "approved", reviewed_at="2026-01-03T00:00:00+00:00")
+        ok = self.store.review_curator_change(change_id, "rejected", reviewed_at="2026-01-04T00:00:00+00:00")
+        self.assertFalse(ok)
+        self.assertEqual(self.store.get_curator_change(change_id)["status"], "approved")
+
+    def test_unknown_change_id_fails(self):
+        ok = self.store.review_curator_change("does-not-exist", "approved", reviewed_at="2026-01-03T00:00:00+00:00")
+        self.assertFalse(ok)
+
+
+class MarkCuratorChangeAppliedTests(_StoreTestCase):
+    def test_approved_to_applied_succeeds(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        self.store.review_curator_change(change_id, "approved", reviewed_at="2026-01-03T00:00:00+00:00")
+        ok = self.store.mark_curator_change_applied(change_id, applied_at="2026-01-04T00:00:00+00:00")
+        self.assertTrue(ok)
+        row = self.store.get_curator_change(change_id)
+        self.assertEqual(row["status"], "applied")
+        self.assertEqual(row["applied_at"], "2026-01-04T00:00:00+00:00")
+
+    def test_proposed_to_applied_fails(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        ok = self.store.mark_curator_change_applied(change_id, applied_at="2026-01-04T00:00:00+00:00")
+        self.assertFalse(ok)
+        row = self.store.get_curator_change(change_id)
+        self.assertEqual(row["status"], "proposed")
+        self.assertIsNone(row["applied_at"])
+
+    def test_rejected_to_applied_fails(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        self.store.review_curator_change(change_id, "rejected", reviewed_at="2026-01-03T00:00:00+00:00")
+        ok = self.store.mark_curator_change_applied(change_id, applied_at="2026-01-04T00:00:00+00:00")
+        self.assertFalse(ok)
+        self.assertEqual(self.store.get_curator_change(change_id)["status"], "rejected")
+
+    def test_already_applied_cannot_be_applied_again(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        self.store.review_curator_change(change_id, "approved", reviewed_at="2026-01-03T00:00:00+00:00")
+        self.store.mark_curator_change_applied(change_id, applied_at="2026-01-04T00:00:00+00:00")
+        ok = self.store.mark_curator_change_applied(change_id, applied_at="2026-01-05T00:00:00+00:00")
+        self.assertFalse(ok)
+        self.assertEqual(self.store.get_curator_change(change_id)["applied_at"], "2026-01-04T00:00:00+00:00")
+
+
+class MarkCuratorChangeFailedTests(_StoreTestCase):
+    def test_approved_to_failed_succeeds_and_applied_at_stays_null(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        self.store.review_curator_change(change_id, "approved", reviewed_at="2026-01-03T00:00:00+00:00")
+        ok = self.store.mark_curator_change_failed(change_id)
+        self.assertTrue(ok)
+        row = self.store.get_curator_change(change_id)
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNone(row["applied_at"])
+
+    def test_proposed_to_failed_fails(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        ok = self.store.mark_curator_change_failed(change_id)
+        self.assertFalse(ok)
+        self.assertEqual(self.store.get_curator_change(change_id)["status"], "proposed")
+
+    def test_applied_to_failed_fails(self):
+        proposal_id = self._create_proposal()
+        change_id = self._create_change(proposal_id)
+        self.store.review_curator_change(change_id, "approved", reviewed_at="2026-01-03T00:00:00+00:00")
+        self.store.mark_curator_change_applied(change_id, applied_at="2026-01-04T00:00:00+00:00")
+        ok = self.store.mark_curator_change_failed(change_id)
+        self.assertFalse(ok)
+        self.assertEqual(self.store.get_curator_change(change_id)["status"], "applied")
+
+
 if __name__ == "__main__":
     unittest.main()

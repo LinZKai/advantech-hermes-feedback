@@ -1960,6 +1960,150 @@ class FeedbackStoreV2:
                 "SELECT * FROM curator_changes WHERE change_id=?", (change_id,)
             ).fetchone()
 
+    def list_curator_changes(
+        self, *, proposal_id: str | None = None, status: str | None = None,
+    ) -> list[sqlite3.Row]:
+        """Every curator_changes row, oldest (created_at) first -- the
+        Dashboard-page counterpart to get_curator_change() (single-row),
+        matching list_improvement_proposals()'s exact optional-filter
+        shape/style: no filter lists everything, proposal_id and/or status
+        narrow it, an invalid status returns [] rather than raising.
+
+        Both filters may be given together (a specific Proposal's rows in
+        a specific status). Neither filter distinguishes "not given" from
+        "given as None" any differently than list_improvement_proposals()
+        already does for review_status -- there is no curator_changes
+        equivalent of list_latest_case_analysis()'s "explicit empty
+        collection" contract here, since proposal_id/status are each a
+        single optional scalar, not a collection.
+        """
+        if status is not None and status not in _CURATOR_CHANGE_STATUS_VALUE_SET:
+            return []
+        query = "SELECT * FROM curator_changes"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if proposal_id is not None:
+            clauses.append("proposal_id=?")
+            params.append(proposal_id)
+        if status is not None:
+            clauses.append("status=?")
+            params.append(status)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at"
+        with self._connect() as db:
+            return db.execute(query, params).fetchall()
+
+    # -- Dashboard MVP aggregate reads ------------------------------------
+    #
+    # Both methods below exist ONLY because no existing list_* method can
+    # answer them without an unreasonable per-Case N+1 scan (list_turns_
+    # for_case/list_feedback_for_case are both Case-scoped, with no
+    # unscoped/global counterpart) -- every other Dashboard Overview
+    # aggregate (Case diagnosis/product distribution, Proposal review_
+    # status distribution, curator_changes status distribution) is
+    # computed in Python, in tools.dashboard_api.views, over an EXISTING
+    # single-call list_* method's full result set, which is sufficient at
+    # this POC's data scale and needs no new store method at all.
+
+    def count_turns(self) -> int:
+        """Total turns across every Case -- the one Overview number no
+        existing method can answer without listing every Case's turns
+        individually first."""
+        with self._connect() as db:
+            return db.execute("SELECT COUNT(*) FROM turns").fetchone()[0]
+
+    def list_all_feedback(self) -> list[sqlite3.Row]:
+        """Every feedback row across every Case, unfiltered -- the
+        Overview-page counterpart to list_feedback_for_case() (Case-
+        scoped). Deterministic ordering: submitted_at, then feedback_id
+        (matching list_feedback_for_case()'s own tie-break convention).
+        The caller aggregates helpful/negative counts and reason_code
+        distribution in Python from this full result set.
+        """
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM feedback ORDER BY submitted_at, feedback_id"
+            ).fetchall()
+
+    def review_curator_change(self, change_id: str, status: str, *, reviewed_at: str) -> bool:
+        """The HUMAN review action for a curator_changes row -- move it
+        from status='proposed' to 'approved'/'rejected'. Curator itself
+        never calls this (see tools.curator_domain's own "Self-improvement
+        boundary" docstring); the process boundary is documented, not
+        type-enforced here, matching update_proposal_review_status()'s own
+        precedent exactly.
+
+        Unlike update_proposal_review_status() (whose UPDATE has no WHERE-
+        clause state guard, leaving "was it actually pending" to the
+        caller to check first), this method's WHERE clause enforces the
+        current status is 'proposed' ATOMICALLY, in the same statement --
+        mirrors complete_reflection_run()'s own "validated UPDATE,
+        rowcount==1" convention (the only other state-machine transition
+        already in this module with more than two legal states). A
+        caller that wants a clearer "not_found" vs. "wrong current state"
+        distinction for a human-facing message should still read the row
+        first (see tools.review_curator_change for that convention) --
+        this method's own contract is just the safe, race-free transition
+        itself.
+
+        Returns False, never raises, for: an invalid status (not
+        'approved'/'rejected'), an unknown change_id, or a change_id whose
+        current status is not 'proposed' (already reviewed, or further
+        along its lifecycle).
+        """
+        if status not in ("approved", "rejected"):
+            return False
+        with self._connect() as db:
+            cur = db.execute(
+                "UPDATE curator_changes SET status=?, reviewed_at=? WHERE change_id=? AND status='proposed'",
+                (status, str(reviewed_at), str(change_id)),
+            )
+            return cur.rowcount == 1
+
+    def mark_curator_change_applied(self, change_id: str, *, applied_at: str) -> bool:
+        """Mark one curator_changes row 'applied' -- the single legal
+        terminal transition from 'approved' after tools.apply_curator_
+        change has ALREADY successfully overwritten target_file. This
+        method itself never touches the filesystem; the caller is
+        responsible for writing the file first and calling this only on
+        success, so a curator_changes row can never say 'applied' while
+        the file write itself failed or never happened.
+
+        Same atomic WHERE-clause guard as review_curator_change(): only a
+        row currently 'approved' can become 'applied'.
+
+        Returns False, never raises, for: an unknown change_id, or a
+        change_id whose current status is not 'approved'.
+        """
+        with self._connect() as db:
+            cur = db.execute(
+                "UPDATE curator_changes SET status='applied', applied_at=? WHERE change_id=? AND status='approved'",
+                (str(applied_at), str(change_id)),
+            )
+            return cur.rowcount == 1
+
+    def mark_curator_change_failed(self, change_id: str) -> bool:
+        """Mark one curator_changes row 'failed' -- the single legal
+        transition from 'approved' when tools.apply_curator_change's own
+        file write itself raised. applied_at is never set by this method
+        (stays NULL, matching the table's own "applied_at is only ever
+        set alongside status='applied'" convention) -- a 'failed' row
+        never claims a file write time that did not actually succeed.
+
+        Same atomic WHERE-clause guard as the other two curator_changes
+        transition methods above.
+
+        Returns False, never raises, for: an unknown change_id, or a
+        change_id whose current status is not 'approved'.
+        """
+        with self._connect() as db:
+            cur = db.execute(
+                "UPDATE curator_changes SET status='failed' WHERE change_id=? AND status='approved'",
+                (str(change_id),),
+            )
+            return cur.rowcount == 1
+
 
 __all__ = [
     "FeedbackStoreV2",
@@ -1974,4 +2118,6 @@ __all__ = [
     "REVIEW_STATUS_VALUES",
     "PROPOSAL_TREND_VALUES",
     "REFLECTION_RUN_STATUS_VALUES",
+    "CHANGE_TYPE_VALUES",
+    "CURATOR_CHANGE_STATUS_VALUES",
 ]
