@@ -604,15 +604,12 @@ RUN if [ "$NEMOCLAW_DARWIN_VM_COMPAT" = "1" ]; then \
 # from the running sandbox.
 
 # Dashboard MVP API (tools/dashboard_api) is a FastAPI app -- neither
-# FastAPI nor its ASGI server (Uvicorn) ship with the base Hermes image,
-# so they are installed explicitly into the existing /opt/hermes/.venv
-# (no separate venv, no requirements.txt/pyproject.toml for this overlay
-# -- this repo has no existing Python dependency-manifest convention to
-# extend, so a direct pip install here is the smallest addition). Pinned
-# to major-version ranges only, matching this Dockerfile's general
-# preference for explicit, reviewable version bounds over an unpinned
-# install.
-RUN /opt/hermes/.venv/bin/python -m pip install --no-cache-dir \
+# FastAPI nor its ASGI server (Uvicorn) ship with the base Hermes image.
+# Install them into the existing /opt/hermes/.venv. The published base
+# image may not expose pip in that venv, so bootstrap pip with ensurepip
+# before installing the two runtime dependencies.
+RUN /opt/hermes/.venv/bin/python -m ensurepip --upgrade \
+    && /opt/hermes/.venv/bin/python -m pip install --no-cache-dir \
         "fastapi>=0.115,<1" \
         "uvicorn>=0.30,<1"
 
