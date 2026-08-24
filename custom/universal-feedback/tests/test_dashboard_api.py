@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from dashboard_api.app import app, get_store  # noqa: E402
 from tools.curator_domain import CURATOR_TARGET_FILE  # noqa: E402
 from tools.feedback_store_v2 import FeedbackStoreV2, RetrievalRunInput  # noqa: E402
+from tools.run_curator import CuratorRunOutcome  # noqa: E402
 from tools.universal_feedback import POLICY_VERSION  # noqa: E402
 
 
@@ -187,6 +188,17 @@ class CasesTests(_ApiTestCase):
         self.assertEqual(row["turn_count"], 1)
         self.assertEqual(row["feedback_summary"]["total"], 1)
         self.assertIn("latest_activity", row)
+        self.assertIsNotNone(row["latest_feedback_submitted_at"])
+
+    def test_list_cases_without_feedback_has_null_latest_feedback_submitted_at(self):
+        # Cases are created from Turns, not from Feedback -- a Case can be
+        # enriched (and therefore listed) with zero feedback rows.
+        self._seed_case("case-1", with_feedback=False)
+        response = self.client.get("/cases")
+        self.assertEqual(response.status_code, 200)
+        row = response.json()[0]
+        self.assertEqual(row["feedback_summary"]["total"], 0)
+        self.assertIsNone(row["latest_feedback_submitted_at"])
 
     def test_case_detail_success(self):
         self._seed_case("case-1")
@@ -308,6 +320,79 @@ class ProposalReviewApiTests(_ApiTestCase):
         response = self.client.post(f"/improvements/{proposal_id}/review", json={"status": "pending"})
         self.assertEqual(response.status_code, 422)
 
+    # -- Accept auto-invokes Curator ---------------------------------------
+
+    def test_accept_invokes_curator_and_reports_success(self):
+        from unittest import mock
+
+        proposal_id = self._seed_proposal_with_observation()
+        fake_outcome = CuratorRunOutcome(
+            status="succeeded", proposal_id=proposal_id, change_id="change-x",
+            change_type="modify_rule", target_file=CURATOR_TARGET_FILE, confidence=0.85,
+        )
+        with mock.patch("dashboard_api.app.resolve_default_analyzer", return_value=lambda *a, **k: None), \
+             mock.patch("dashboard_api.app.run_curator", return_value=fake_outcome) as mock_run_curator:
+            response = self.client.post(f"/improvements/{proposal_id}/review", json={"status": "accepted"})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "reviewed")
+        self.assertEqual(self.store.get_improvement_proposal(proposal_id)["review_status"], "accepted")
+        self.assertEqual(body["curator"]["status"], "succeeded")
+        self.assertEqual(body["curator"]["change_id"], "change-x")
+        mock_run_curator.assert_called_once()
+        self.assertEqual(mock_run_curator.call_args.kwargs["proposal_id"], proposal_id)
+
+    def test_reject_never_invokes_curator(self):
+        from unittest import mock
+
+        proposal_id = self._seed_proposal_with_observation()
+        with mock.patch("dashboard_api.app.run_curator") as mock_run_curator:
+            response = self.client.post(f"/improvements/{proposal_id}/review", json={"status": "rejected"})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "reviewed")
+        self.assertNotIn("curator", body)
+        mock_run_curator.assert_not_called()
+        self.assertEqual(self.store.get_improvement_proposal(proposal_id)["review_status"], "rejected")
+        self.assertEqual(self.store.list_curator_changes(proposal_id=proposal_id), [])
+
+    def test_accept_curator_generation_failure_keeps_proposal_accepted(self):
+        from unittest import mock
+
+        proposal_id = self._seed_proposal_with_observation()
+        fake_outcome = CuratorRunOutcome(status="analyzer_failed", proposal_id=proposal_id, error="LLM boom")
+        with mock.patch("dashboard_api.app.resolve_default_analyzer", return_value=lambda *a, **k: None), \
+             mock.patch("dashboard_api.app.run_curator", return_value=fake_outcome):
+            response = self.client.post(f"/improvements/{proposal_id}/review", json={"status": "accepted"})
+
+        # The Proposal Accept itself is never rolled back for a Curator failure.
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "reviewed")
+        self.assertEqual(self.store.get_improvement_proposal(proposal_id)["review_status"], "accepted")
+        self.assertEqual(body["curator"]["status"], "analyzer_failed")
+        self.assertEqual(body["curator"]["error"], "LLM boom")
+        self.assertEqual(self.store.list_curator_changes(proposal_id=proposal_id), [])
+
+    def test_accept_curator_runtime_config_unavailable_is_reported_not_raised(self):
+        # No mocking at all: this test's own environment has no hermes_cli
+        # installed (see this module's own docstring), so resolve_default_
+        # analyzer() genuinely raises RuntimeError here -- exactly what
+        # happens if this endpoint is ever run outside a built Hermes
+        # sandbox image. Proves the endpoint degrades gracefully rather
+        # than 500ing.
+        proposal_id = self._seed_proposal_with_observation()
+        response = self.client.post(f"/improvements/{proposal_id}/review", json={"status": "accepted"})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(self.store.get_improvement_proposal(proposal_id)["review_status"], "accepted")
+        self.assertEqual(body["curator"]["status"], "analyzer_failed")
+        self.assertIsNotNone(body["curator"]["error"])
+        self.assertEqual(self.store.list_curator_changes(proposal_id=proposal_id), [])
+
 
 # ---------------------------------------------------------------------------
 # POST /curator-changes/{change_id}/review
@@ -315,19 +400,53 @@ class ProposalReviewApiTests(_ApiTestCase):
 
 
 class CuratorReviewApiTests(_ApiTestCase):
-    def test_approve_success(self):
-        proposal_id = self._seed_proposal_with_observation()
-        change_id = self._seed_curator_change(proposal_id)
-        response = self.client.post(f"/curator-changes/{change_id}/review", json={"status": "approved"})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.store.get_curator_change(change_id)["status"], "approved")
+    def setUp(self):
+        super().setUp()
+        self._agents_tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.agents_path = Path(self._agents_tmpdir.name) / "AGENTS.md"
 
-    def test_reject_success(self):
+    def tearDown(self):
+        self._agents_tmpdir.cleanup()
+        super().tearDown()
+
+    def test_approve_success_applies_immediately(self):
+        from unittest import mock
+
+        before_content = "# AGENTS.md\n"
+        proposed_content = "# AGENTS.md\n\nBe direct.\n"
+        self.agents_path.write_text(before_content, encoding="utf-8")
         proposal_id = self._seed_proposal_with_observation()
-        change_id = self._seed_curator_change(proposal_id)
-        response = self.client.post(f"/curator-changes/{change_id}/review", json={"status": "rejected"})
+        change_id = self._seed_curator_change(
+            proposal_id, before_content=before_content, proposed_content=proposed_content,
+        )
+
+        with mock.patch("dashboard_api.app.CURATOR_TARGET_FILE", str(self.agents_path)):
+            response = self.client.post(f"/curator-changes/{change_id}/review", json={"status": "approved"})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "applied")
+        self.assertIsNotNone(body["applied_at"])
+
+        row = self.store.get_curator_change(change_id)
+        self.assertEqual(row["status"], "applied")
+        self.assertIsNotNone(row["applied_at"])
+        self.assertEqual(self.agents_path.read_text(encoding="utf-8"), proposed_content)
+
+    def test_reject_success_never_applies(self):
+        from unittest import mock
+
+        before_content = "# AGENTS.md\n"
+        self.agents_path.write_text(before_content, encoding="utf-8")
+        proposal_id = self._seed_proposal_with_observation()
+        change_id = self._seed_curator_change(proposal_id, before_content=before_content)
+
+        with mock.patch("dashboard_api.app.CURATOR_TARGET_FILE", str(self.agents_path)):
+            response = self.client.post(f"/curator-changes/{change_id}/review", json={"status": "rejected"})
+
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.store.get_curator_change(change_id)["status"], "rejected")
+        self.assertEqual(self.agents_path.read_text(encoding="utf-8"), before_content)
 
     def test_invalid_transition_returns_409(self):
         proposal_id = self._seed_proposal_with_observation()
@@ -335,6 +454,32 @@ class CuratorReviewApiTests(_ApiTestCase):
         response = self.client.post(f"/curator-changes/{change_id}/review", json={"status": "approved"})
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["detail"]["status"], "not_proposed")
+
+    def test_approve_apply_guard_failure_source_changed_leaves_status_approved(self):
+        from unittest import mock
+
+        before_content = "# AGENTS.md\n"
+        proposed_content = "# AGENTS.md\n\nBe direct.\n"
+        drifted_content = "# AGENTS.md\n\nSomeone else already changed this.\n"
+        # AGENTS.md on "disk" has already drifted away from before_content --
+        # simulates a change landing between Curator's proposal and this
+        # Approve.
+        self.agents_path.write_text(drifted_content, encoding="utf-8")
+        proposal_id = self._seed_proposal_with_observation()
+        change_id = self._seed_curator_change(
+            proposal_id, before_content=before_content, proposed_content=proposed_content,
+        )
+
+        with mock.patch("dashboard_api.app.CURATOR_TARGET_FILE", str(self.agents_path)):
+            response = self.client.post(f"/curator-changes/{change_id}/review", json={"status": "approved"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"]["status"], "source_changed")
+
+        row = self.store.get_curator_change(change_id)
+        self.assertEqual(row["status"], "approved")
+        self.assertIsNone(row["applied_at"])
+        self.assertEqual(self.agents_path.read_text(encoding="utf-8"), drifted_content)
 
 
 # ---------------------------------------------------------------------------

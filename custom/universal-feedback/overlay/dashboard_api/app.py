@@ -7,8 +7,9 @@ Dashboard frontend (not built in this slice).
      v
     dashboard_api.views    (pure read-projection functions, no FastAPI import)
      |                       tools.review_proposal.review_proposal()
-     |                       tools.review_curator_change.review_curator_change()
-     |                       tools.apply_curator_change.apply_curator_change()
+     |                       tools.run_curator.run_curator()              (auto-invoked
+     |                       tools.review_curator_change.review_curator_change()  right after an
+     |                       tools.apply_curator_change.apply_curator_change()    Accept/Approve)
      v
     dashboard_api.app       (THIS module -- thin HTTP adapter only)
      |
@@ -18,9 +19,32 @@ Dashboard frontend (not built in this slice).
 No new business logic anywhere in this module: every GET endpoint calls a
 pure function in dashboard_api.views; every POST endpoint calls the exact
 same already-tested Slice 1/2 business function tools/review_proposal.py,
-tools/review_curator_change.py, and tools/apply_curator_change.py's own
-CLIs already call. This module's only job is mapping a domain outcome
-string/dataclass to an HTTP status code and a JSON body.
+tools/run_curator.py, tools/review_curator_change.py, and tools/
+apply_curator_change.py's own CLIs already call. This module's only job is
+mapping a domain outcome string/dataclass to an HTTP status code and a
+JSON body.
+
+Human-in-the-loop gates are unchanged -- there are still exactly two:
+Proposal Accept/Reject and CuratorChange Approve/Reject. What changed is
+what happens automatically ONE step after each gate, still synchronously
+within the same HTTP request/response:
+  * POST /improvements/{id}/review with status="accepted" -> after the
+    Proposal is committed accepted, this module immediately calls tools.
+    run_curator.run_curator() itself (no subprocess, no queue). A Reject
+    NEVER reaches this call. A Curator failure (any CuratorRunOutcome
+    status other than "succeeded"/"no_change_recommended") does NOT roll
+    back the already-committed Proposal Accept -- it is reported back in
+    the same 200 response's nested "curator" object.
+  * POST /curator-changes/{id}/review with status="approved" -> after the
+    CuratorChange is committed approved, this module immediately calls
+    tools.apply_curator_change.apply_curator_change() itself. A Reject
+    NEVER reaches this call. Every one of apply_curator_change()'s
+    deterministic guards (status=='approved', target_file, non-empty
+    content, AGENTS.md readable, before_content match, atomic write) is
+    still fully in force -- an apply guard failure (e.g. "source_changed")
+    leaves curator_changes.status at 'approved' (never falsely 'applied')
+    and is reported as a non-2xx HTTP response, matching this endpoint's
+    own dedicated /apply counterpart below exactly.
 
 Naming note: "dashboard_api" is unrelated to Hermes' own built-in browser
 dashboard (`hermes dashboard`) -- see dashboard_api.views's own docstring
@@ -62,6 +86,7 @@ from tools.curator_domain import CURATOR_TARGET_FILE  # noqa: E402
 from tools.feedback_store_v2 import DEFAULT_PATH, FeedbackStoreV2  # noqa: E402
 from tools.review_curator_change import review_curator_change  # noqa: E402
 from tools.review_proposal import review_proposal  # noqa: E402
+from tools.run_curator import CuratorRunOutcome, resolve_default_analyzer, run_curator  # noqa: E402
 
 app = FastAPI(title="Hermes Feedback Dashboard API", version="0.1.0")
 
@@ -152,15 +177,49 @@ _PROPOSAL_REVIEW_HTTP_STATUS = {
 }
 
 
+def _run_curator_after_accept(store: FeedbackStoreV2, proposal_id: str) -> dict[str, Any]:
+    """Invoke Curator synchronously, immediately after a Proposal Accept
+    has already been committed by the caller. Reused business logic only:
+    resolve_default_analyzer()/run_curator() are the exact same functions
+    tools/run_curator.py's own CLI calls -- nothing re-implemented here.
+
+    Never raises. The Proposal Accept above is already durably committed
+    and must never be rolled back for a Curator failure (LLM runtime
+    config unresolved, analyzer error, or any other tools.run_curator.
+    CuratorRunOutcome failure status) -- every outcome, success or
+    failure, is folded into this same plain dict for the endpoint's 200
+    response body's "curator" key.
+    """
+    try:
+        analyzer = resolve_default_analyzer()
+    except RuntimeError as exc:
+        outcome = CuratorRunOutcome(status="analyzer_failed", proposal_id=proposal_id, error=str(exc))
+    else:
+        outcome = run_curator(
+            store, proposal_id=proposal_id, agents_file=Path(CURATOR_TARGET_FILE), analyzer=analyzer,
+        )
+    return {
+        "status": outcome.status,
+        "change_id": outcome.change_id,
+        "change_type": outcome.change_type,
+        "confidence": outcome.confidence,
+        "error": outcome.error,
+    }
+
+
 @app.post("/improvements/{proposal_id}/review")
 def review_proposal_endpoint(
     proposal_id: str, body: ProposalReviewRequest, store: FeedbackStoreV2 = Depends(get_store),
 ) -> dict[str, Any]:
     result = review_proposal(store, proposal_id=proposal_id, review_status=body.status)
     http_status = _PROPOSAL_REVIEW_HTTP_STATUS.get(result, 500)
-    payload = {"status": result, "proposal_id": proposal_id}
+    payload: dict[str, Any] = {"status": result, "proposal_id": proposal_id}
     if http_status >= 400:
         raise HTTPException(status_code=http_status, detail=payload)
+
+    if body.status == "accepted":
+        payload["curator"] = _run_curator_after_accept(store, proposal_id)
+
     return payload
 
 
@@ -171,25 +230,15 @@ _CURATOR_REVIEW_HTTP_STATUS = {
     "update_failed": 500,
 }
 
-
-@app.post("/curator-changes/{change_id}/review")
-def review_curator_change_endpoint(
-    change_id: str, body: CuratorReviewRequest, store: FeedbackStoreV2 = Depends(get_store),
-) -> dict[str, Any]:
-    result = review_curator_change(store, change_id=change_id, status=body.status)
-    http_status = _CURATOR_REVIEW_HTTP_STATUS.get(result, 500)
-    payload = {"status": result, "change_id": change_id}
-    if http_status >= 400:
-        raise HTTPException(status_code=http_status, detail=payload)
-    return payload
-
-
 # "not_approved"/"wrong_target"/"empty_content"/"source_changed" are all
 # client-visible illegal-state-to-apply-from conditions -> 409 (retrying
 # the identical request will never succeed without changing something
 # first). "agents_file_unreadable"/"write_failed"/"file_written_db_
 # update_failed" are environment/internal problems the client cannot fix
-# by changing its request -> 500.
+# by changing its request -> 500. Shared by review_curator_change_endpoint
+# (auto-apply after Approve) and apply_curator_change_endpoint (the
+# dedicated, still-present /apply endpoint) below -- one mapping, reused,
+# never duplicated.
 _APPLY_HTTP_STATUS = {
     "applied": 200,
     "not_found": 404,
@@ -203,6 +252,47 @@ _APPLY_HTTP_STATUS = {
 }
 
 
+@app.post("/curator-changes/{change_id}/review")
+def review_curator_change_endpoint(
+    change_id: str, body: CuratorReviewRequest, store: FeedbackStoreV2 = Depends(get_store),
+) -> dict[str, Any]:
+    result = review_curator_change(store, change_id=change_id, status=body.status)
+    http_status = _CURATOR_REVIEW_HTTP_STATUS.get(result, 500)
+    payload: dict[str, Any] = {"status": result, "change_id": change_id}
+    if http_status >= 400:
+        raise HTTPException(status_code=http_status, detail=payload)
+
+    if body.status != "approved":
+        return payload
+
+    # Approve just committed (status='proposed' -> 'approved'). Immediately
+    # invoke the existing, unchanged apply pipeline -- same function, same
+    # guards, same fail-closed outcomes as the dedicated /apply endpoint
+    # below. A guard failure (e.g. "source_changed") leaves curator_changes.
+    # status at 'approved' (apply_curator_change() never touches it in that
+    # case) and is surfaced here as the identical non-2xx status/detail
+    # shape the dedicated /apply endpoint already uses -- never silently
+    # claimed as applied.
+    outcome: ApplyOutcome = apply_curator_change(
+        store, change_id=change_id, agents_file=Path(CURATOR_TARGET_FILE),
+    )
+    apply_http_status = _APPLY_HTTP_STATUS.get(outcome.status, 500)
+    if apply_http_status >= 400:
+        detail: dict[str, Any] = {"status": outcome.status, "change_id": change_id}
+        if outcome.error:
+            detail["message"] = outcome.error
+        raise HTTPException(status_code=apply_http_status, detail=detail)
+
+    return {"status": outcome.status, "change_id": change_id, "applied_at": outcome.applied_at}
+
+
+# Still present as its own endpoint -- deliberately not removed even though
+# the frontend's "Apply to Runtime" button is gone (see this module's own
+# top docstring): a curator_changes row that auto-apply left at 'approved'
+# after a "source_changed" guard failure can legitimately still apply later
+# once AGENTS.md is reconciled (see tools.apply_curator_change's own
+# docstring for that exact reasoning) -- this endpoint is that manual retry
+# path, with no UI wired to it in this POC.
 @app.post("/curator-changes/{change_id}/apply")
 def apply_curator_change_endpoint(
     change_id: str, store: FeedbackStoreV2 = Depends(get_store),

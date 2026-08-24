@@ -179,6 +179,27 @@ def _resolve_main_runtime() -> dict[str, Any]:
     return main_runtime
 
 
+def resolve_default_analyzer() -> Analyzer:
+    """Resolve the real LLM-backed analyzer -- `_resolve_main_runtime()`
+    bound via functools.partial to tools.curator_analyzer.analyze_
+    proposal_with_llm. This is the exact same resolution main() has always
+    performed for the CLI entrypoint, factored out so dashboard_api.app can
+    reuse it verbatim (to auto-invoke Curator immediately after a Proposal
+    Accept) without duplicating this domain's own runtime-config logic in
+    the FastAPI layer.
+
+    Raises RuntimeError (propagated from _resolve_main_runtime()) if
+    hermes_cli.config is not importable, or config.yaml's model section is
+    missing/incomplete -- never falls back to a different provider/model.
+    Never raises for any other reason; callers needing a non-raising
+    outcome (e.g. dashboard_api.app, which must fold this into a
+    CuratorRunOutcome-shaped response rather than a 500) catch RuntimeError
+    themselves.
+    """
+    main_runtime = _resolve_main_runtime()
+    return functools.partial(analyze_proposal_with_llm, main_runtime=main_runtime)
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -403,11 +424,10 @@ def main(argv: list[str] | None = None, *, analyzer: Analyzer | None = None) -> 
     real_analyzer = analyzer
     if real_analyzer is None:
         try:
-            main_runtime = _resolve_main_runtime()
+            real_analyzer = resolve_default_analyzer()
         except RuntimeError as exc:
             print(f"ERROR: cannot resolve LLM runtime configuration: {exc}", file=sys.stderr)
             return 1
-        real_analyzer = functools.partial(analyze_proposal_with_llm, main_runtime=main_runtime)
 
     outcome = run_curator(
         store, proposal_id=args.proposal_id, agents_file=args.agents_file, analyzer=real_analyzer,

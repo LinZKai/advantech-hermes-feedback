@@ -118,6 +118,15 @@ def list_cases(store: FeedbackStoreV2) -> list[dict[str, Any]]:
     this the simpler option (see this module's own docstring). turn_count
     and latest_activity both reuse the SAME list_turns_for_case() call
     (no separate query for each).
+
+    latest_feedback_submitted_at is the MAX(feedback.submitted_at) for this
+    Case, or None when it has no feedback at all -- read off the same
+    feedback_rows already fetched for feedback_summary, no new query. Added
+    for the frontend's Cases & Feedback time-range filter: feedback
+    submission time is a more meaningful "when did this happen" signal than
+    latest_activity (last turn's created_at) when a Case has feedback, since
+    it is the actual user action being filtered for; latest_activity remains
+    the frontend's fallback for Cases with no feedback yet.
     """
     analysis_rows = store.list_latest_case_analysis(case_ids=None)
     cases: list[dict[str, Any]] = []
@@ -127,6 +136,9 @@ def list_cases(store: FeedbackStoreV2) -> list[dict[str, Any]]:
         feedback_rows = store.list_feedback_for_case(case_id)
         helpful_count = sum(1 for f in feedback_rows if f["helpful"])
         latest_activity = max((t["created_at"] for t in turns), default=row["analyzed_at"])
+        latest_feedback_submitted_at = max(
+            (f["submitted_at"] for f in feedback_rows), default=None,
+        )
 
         cases.append({
             "case_id": case_id,
@@ -142,6 +154,7 @@ def list_cases(store: FeedbackStoreV2) -> list[dict[str, Any]]:
                 "negative_count": len(feedback_rows) - helpful_count,
             },
             "latest_activity": latest_activity,
+            "latest_feedback_submitted_at": latest_feedback_submitted_at,
         })
 
     cases.sort(key=lambda c: c["latest_activity"] or "", reverse=True)
