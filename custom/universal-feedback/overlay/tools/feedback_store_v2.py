@@ -1,7 +1,11 @@
 """SQLite storage for the Session -> Case -> Turn -> {Retrieval Run,
-Feedback, Case Analysis} -> {Reflection Run, Improvement Proposal} schema
-(v2): sessions, cases, turns, retrieval_runs, feedback, case_analysis,
-reflection_runs, improvement_proposals, proposal_observations.
+Feedback, Case Analysis} -> {Reflection Run, Improvement Proposal} ->
+Curator Change schema (v2). The 10 v2 tables this module owns:
+sessions, cases, turns, retrieval_runs, feedback, case_analysis,
+reflection_runs, improvement_proposals, proposal_observations,
+curator_changes. (The legacy `feedback_runs` table is a separate,
+Telegram-callback-authorization-shaped table owned by
+tools.feedback_storage, in the same database file.)
 
 Deliberately a separate module from tools.feedback_storage, which keeps
 serving the legacy `feedback_runs` table (a different, Telegram-callback-
@@ -218,11 +222,15 @@ CHANGE_TYPE_VALUES: tuple[str, ...] = (
 _CHANGE_TYPE_VALUE_SET = frozenset(CHANGE_TYPE_VALUES)
 
 # status: a curator_changes row's own review/apply lifecycle.
-# create_curator_change() only ever inserts 'proposed' -- moving a row to
-# 'approved'/'rejected' (human review) or 'applied'/'failed' (a future
-# apply step) is explicitly OUT OF SCOPE for this slice and is not
-# implemented by any function in this module or in tools.curator_domain/
-# tools.curator_analyzer/tools.run_curator.
+# create_curator_change() only ever inserts 'proposed'. The later
+# transitions ARE implemented: 'proposed' -> 'approved'/'rejected' is the
+# human review action (review_curator_change() in this module, wrapped by
+# tools.review_curator_change / the dashboard); 'approved' ->
+# 'applied'/'failed' is the deterministic apply step
+# (mark_curator_change_applied() / mark_curator_change_failed() in this
+# module, driven by tools.apply_curator_change after it has actually
+# overwritten target_file). tools.curator_domain / tools.curator_analyzer /
+# tools.run_curator still never move a row past 'proposed' themselves.
 CURATOR_CHANGE_STATUS_VALUES: tuple[str, ...] = (
     "proposed",
     "approved",
@@ -320,12 +328,12 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         tool_call_id           TEXT,
 
         request_attempted      INTEGER CHECK (request_attempted IN (0, 1)),
-        -- Post-003 shape (see migration 003 / module docstring above): a
-        -- brand-new database is created directly with 'blocked' and
-        -- 'unparseable' already allowed. An *existing* pre-003 database
-        -- does not get this from CREATE TABLE IF NOT EXISTS alone (a
-        -- no-op against an existing table) -- see
-        -- _upgrade_retrieval_runs_execution_statuses().
+        -- Post-003 shape (see migration 003, history only): a brand-new
+        -- database is created directly with 'blocked' and 'unparseable'
+        -- already allowed. An *existing* pre-003 database keeps its
+        -- narrower CHECK -- CREATE TABLE IF NOT EXISTS is a no-op against
+        -- an existing table, and there is no in-place upgrade step (see
+        -- _migrate_schema's docstring: delete the file to recreate).
         execution_status        TEXT NOT NULL CHECK (execution_status IN (
             'completed', 'failed', 'timed_out', 'http_error',
             'network_error', 'invalid_response', 'no_documents', 'unknown',
@@ -628,10 +636,18 @@ class RetrievalRunInput:
 
 
 class FeedbackStoreV2:
-    """Storage API for sessions/cases/turns/retrieval_runs/feedback.
+    """Storage API for every v2 table (sessions, cases, turns,
+    retrieval_runs, feedback, case_analysis, reflection_runs,
+    improvement_proposals, proposal_observations, curator_changes).
 
-    Not wired into the gateway or any adapter in this phase -- callers are
-    expected to supply every value explicitly.
+    In production this store IS reached from the gateway and adapter, via
+    thin glue layers rather than directly: tools.retrieval_runtime (turn /
+    retrieval / Case-routing persistence from gateway/run.py and
+    gateway/platforms/base.py), tools.feedback_mirror (from the Telegram
+    adapter), the batch runners (tools.run_case_enrichment /
+    tools.run_reflector / tools.run_curator and the review/apply helpers),
+    and dashboard_api. This class itself still takes every value
+    explicitly and does no gateway-envelope parsing of its own.
     """
 
     def __init__(self, path: Path | str = DEFAULT_PATH, *, migrate: bool = True):

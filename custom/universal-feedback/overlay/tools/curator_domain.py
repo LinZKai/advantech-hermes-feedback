@@ -38,10 +38,16 @@ step in this whole domain closest to an actual file edit: producing a
 CuratorChange is NEVER itself an edit. No function in this module, or in
 tools.curator_analyzer/tools.curator_prompt_context/tools.run_curator/
 tools.review_proposal, writes to /sandbox/AGENTS.md or any other file. A
-CuratorChange is a recommendation persisted with status='proposed' --
-reviewing it (-> approved/rejected) and applying it (-> applied/failed)
-are both explicitly OUT OF SCOPE for this slice and are not implemented
-anywhere in this codebase yet.
+CuratorChange is created with status='proposed' and goes no further on its
+own.
+
+Review and apply DO exist, as separate, human-gated steps outside this
+module: reviewing it (-> approved/rejected) is tools.review_curator_change
+(and the dashboard), and applying an approved change (-> applied/failed,
+the only step that actually overwrites /sandbox/AGENTS.md) is
+tools.apply_curator_change, which re-checks every guard (status=='approved',
+target_file, non-empty proposed_content, and current file content ==
+before_content) and writes atomically.
 """
 from __future__ import annotations
 

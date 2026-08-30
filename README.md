@@ -366,6 +366,23 @@ uvicorn dashboard_api.app:app --host 0.0.0.0 --port 8800
 | `overlay/gateway/platforms/base.py` | 非 streaming 的 delivery path 不經過 `run.py` 上面那段，最終送出的 `text_content` 要等到 base 的 media/TTS 抽取管線跑完才確定 | non-streaming leg：用 `run.py` 先前 stash 在 `event.metadata` 的 context，在確定 `text_content` 後呼叫 `persist_turn_observation_context` 落地 turn；並在此送出 Universal Feedback prompt（與 streaming leg 以 `universal_feedback_handled` 互斥） |
 | `overlay/plugins/platforms/telegram/adapter.py` | 直接沿用 Hermes 原生 Telegram Adapter，但原生 adapter 沒有 feedback inline keyboard / callback / 原因選單 / suggestion 回覆 / 授權 / mirror | `send_universal_feedback` / `_send_feedback_prompt`（inline keyboard）；`_handle_callback_query` 內的 `fb:h/u/r` 分支；`_authorize_universal_feedback_run`（fail-closed 授權）；負向原因選單（`fb:r:<run_id>:<code>`）；`_try_handle_feedback_suggestion_reply`（攔截對 feedback 訊息的文字回覆）；呼叫 `feedback_mirror.*` 鏡射進 v2 |
 
+### 如何在 vendored 檔中找到整合點
+
+這 3 支檔是整份 upstream copy（`run.py` 約 20000 行），本專案的插入點都帶有固定的
+comment 前綴，直接 grep 即可定位（每個 hook 也都用 `logger.debug(...)` 包在自己的
+try/except 內，是額外的 grep 錨點）：
+
+| grep 關鍵字 | 對應整合點 |
+|---|---|
+| `Phase 3A` | Turn / Retrieval observation persistence（`run.py` streaming leg + pre-send context、`base.py` non-streaming leg） |
+| `Phase 4A Stage C` / `_StreamEnvelopeFilter` / `Case Routing Control Envelope` | Case Routing：candidate 查詢、prompt 組裝、streaming 遮蔽、回傳後解析 |
+| `Phase 3B` | Telegram callback 結果鏡射進 v2 `feedback`（`adapter.py`） |
+| `Universal feedback` / `universal_feedback_handled` / `send_universal_feedback` | Feedback prompt 送出 hook（`run.py` + `base.py`，兩 leg 互斥） |
+| `--- Feedback callbacks` / `_authorize_universal_feedback_run` / `_try_handle_feedback_suggestion_reply` | Telegram feedback callback / 授權 / suggestion 回覆（`adapter.py`） |
+| `from tools.` | 所有 `overlay/tools/*` 的 import 點（多為 function 內 lazy import） |
+
+（"Phase 3A / 3B / 4A" 是本專案開發階段的內部代號，不是 Hermes 的概念。）
+
 ### 為什麼不得不修改 Core
 
 本專案大多數能力都寫成新增 Module（`overlay/tools/*`）。但
@@ -403,7 +420,7 @@ lifecycle hook / plugin extension point，即可評估降低 Core 修改範圍�
 
 - **Path**：`/sandbox/.hermes/data/support_feedback.db`
 - **Engine**：SQLite（Python 內建 `sqlite3`，無 ORM）
-- **Legacy + v2 共用同一檔**：legacy `feedback_runs` 與 v2 的 11 張表在同一個 db。
+- **Legacy + v2 共用同一檔**：legacy `feedback_runs`（1 張）與 v2 的 10 張表在同一個 db（共 11 張）。
 - **v2 連線 PRAGMA**：`foreign_keys=ON`、`journal_mode=WAL`、`busy_timeout=5000`。
   legacy 連線不開 `foreign_keys`。
 - **主要 tables**：`feedback_runs`、`sessions`、`cases`、`turns`、`retrieval_runs`、
@@ -516,6 +533,9 @@ flowchart LR
 - **`agent.auxiliary_client` / `hermes_cli.config` 只存在於 built sandbox image**：本
   repo 的測試環境沒有，所以所有 analyzer / runner 都用 lazy import + 依賴注入；
   runner 若不在 sandbox 內執行會 fail closed。
+
+未來可改善但**刻意未在交接前處理**的較大項目（模組拆分、Core overlay 依賴、
+migrations 定位等），另見 [docs/HANDOFF_TECH_DEBT.md](docs/HANDOFF_TECH_DEBT.md)。
 
 ---
 

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Reflector Real Reasoning Smoke Test -- EXPERIMENT ONLY, NOT production code.
+"""Reflector Real Reasoning Smoke Test -- manual dev aid, NOT production code.
 
 This script is not part of the Hermes overlay (it lives outside overlay/, so
 it is never deployed alongside tools/reflector_analyzer.py), is not wired
-into any production path, never touches a database, and is intended to be
-deleted once its findings have been reviewed -- see the Phase 5 "Reflector
-Real Reasoning Smoke Test" report for the recommendation on whether to keep
-or delete it.
+into any production path, is not run by the test suite, and never touches a
+database. It exists so a human can eyeball the real Reflector prompt +
+parser against a controlled synthetic input; nothing depends on it.
 
 Purpose: exercise the REAL production Reflector analyzer boundary --
 

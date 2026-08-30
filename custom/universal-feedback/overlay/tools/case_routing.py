@@ -438,7 +438,11 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# Future Stage B Notes -- documented here, NOT implemented in this stage.
+# Stage B Notes -- the persistence-layer decisions the parser above cannot
+# make. These were originally "future" notes; Stage B is now implemented in
+# tools.retrieval_runtime (_resolve_case_assignment / _get_or_create_real_
+# case / _get_or_create_turn / persist_turn_and_retrieval), and both points
+# below have been followed there. Kept as a record of the reasoning.
 # ---------------------------------------------------------------------------
 #
 # 1. Idempotent Case creation must not blanket-catch IntegrityError. When a

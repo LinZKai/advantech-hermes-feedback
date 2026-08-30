@@ -19,20 +19,17 @@
 | Engine | SQLite（Python 內建 `sqlite3`，無 ORM） |
 | Path | `/sandbox/.hermes/data/support_feedback.db`（`feedback_storage.DEFAULT_PATH`） |
 | 建立方式 | 第一次建構 `FeedbackStore()` 或 `FeedbackStoreV2()` 時，以 `CREATE TABLE IF NOT EXISTS` 直接建立目前 shape；沒有 migration runner，也不會逐版套用 `001`～`007` |
-| Legacy / v2 關係 | Legacy `feedback_runs` 與 v2 的 11 張 table **共用同一個 db 檔案**；彼此以 `feedback_runs.turn_key = turns.turn_id` 這個 soft link 關聯，沒有 FK |
+| Legacy / v2 關係 | Legacy `feedback_runs`（1 張）與 v2 的 10 張 table **共用同一個 db 檔案**；彼此以 `feedback_runs.turn_key = turns.turn_id` 這個 soft link 關聯，沒有 FK |
 | PRAGMA（v2 連線，每次 `FeedbackStoreV2._connect()`） | `foreign_keys=ON`、`journal_mode=WAL`、`busy_timeout=5000` |
 | PRAGMA（legacy 連線，`FeedbackStore._connect()`） | 無（純 `sqlite3.connect`，`foreign_keys` 未開啟） |
 | 一致性慣例 | 所有 `*_at` / `*_watermark` 皆為 `datetime.now(timezone.utc).isoformat()` 字串，lexical 比較等同時間順序 |
 | 資料保存 | Sandbox 內無 persistent volume；sandbox 重建即整份 db 消失（POC 可接受，資料可重新產生） |
 
-正式使用中的 Table（共 12 張）：
+正式使用中的 Table（共 11 張 = legacy 1 + v2 10）：
 
-`feedback_runs`、`sessions`、`cases`、`turns`、`retrieval_runs`、`feedback`、
+`feedback_runs`（legacy）、`sessions`、`cases`、`turns`、`retrieval_runs`、`feedback`、
 `case_analysis`、`reflection_runs`、`improvement_proposals`、`proposal_observations`、
 `curator_changes`。
-
-（`feedback_store_v2.py` 的 module docstring 只列 9 張 v2 table，未包含
-`case_analysis` 之後才加入的表；以本文件為準。）
 
 ---
 
