@@ -17,7 +17,7 @@ Every public entry point here is fail-closed: it catches every exception
 internally and returns False/None rather than raising, because Phase 3A
 telemetry is a side channel that must never affect the answer, the legacy
 feedback_runs flow, or negative-feedback reason/suggestion collection (see
-AGENTS.md and docs/current-baseline.md for the layering this preserves).
+the repository README.md for the layering this preserves).
 The two top-level persistence entry points (observe_and_persist_turn,
 persist_turn_observation_context) return a real bool -- True only when the
 Turn row was actually written -- never None, so a caller can always tell

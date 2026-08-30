@@ -534,9 +534,6 @@ flowchart LR
   repo 的測試環境沒有，所以所有 analyzer / runner 都用 lazy import + 依賴注入；
   runner 若不在 sandbox 內執行會 fail closed。
 
-未來可改善但**刻意未在交接前處理**的較大項目（模組拆分、Core overlay 依賴、
-migrations 定位等），另見 [docs/HANDOFF_TECH_DEBT.md](docs/HANDOFF_TECH_DEBT.md)。
-
 ---
 
 ## Development
