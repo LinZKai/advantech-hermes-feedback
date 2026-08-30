@@ -1,28 +1,20 @@
 # Current Feedback Baseline
 
-## Working behavior
+> **本檔案已由 [`../README.md`](../README.md) 與
+> [`DATABASE_DICTIONARY.md`](DATABASE_DICTIONARY.md) 取代。**
+> 保留檔名是因為 `overlay/tools/retrieval_runtime.py` 的 docstring 仍引用此路徑。
+> 早期的 POC 限制清單（無 negative reason、無 suggestion、無 dashboard API 等）
+> **均已不再適用**——請一律以 README 與現行 code 為準。
 
-- Telegram assistant responses support post-delivery feedback prompts.
-- Universal feedback uses `fb:h:<run_id>` and `fb:u:<run_id>`.
-- Callback submission verifies the chat and original Telegram user.
-- The first accepted response is stored in SQLite.
-- The feedback message is updated after submission.
+## 目前實際狀態（摘要）
 
-## Current limitations
+- Universal Feedback：👍/👎、負向原因（5 個 reason code）、選填文字建議皆已實作。
+- 每個 Hermes turn 自動落地 `sessions` / `cases` / `turns` / `retrieval_runs`。
+- Case Routing（`case-router-v1`）、Case Analysis、Reflector、Curator、Dashboard API
+  皆已實作。
+- Case Analysis / Reflector / Curator / Apply 為**手動觸發，無 scheduler**。
+- 3 個 Hermes Core 檔案以 full-file overlay 覆蓋（`gateway/run.py`、
+  `gateway/platforms/base.py`、`plugins/platforms/telegram/adapter.py`），綁定
+  Hermes v0.18.0。
 
-- Negative feedback ends immediately after the thumbs-down click.
-- There is no negative-reason selection UI.
-- There is no optional suggestion input flow.
-- The runtime table still contains legacy resolution-related fields.
-- Migration behavior is partly implemented at runtime.
-- Some large Hermes core files are copied as complete overlays.
-- Custom automated tests have not yet been added.
-
-## Next implementation order
-
-1. Freeze this working version as the Git baseline.
-2. Add tests for callback parsing and storage behavior.
-3. Implement negative-reason selection.
-4. Implement optional suggestion capture.
-5. Refactor storage schema and versioned migrations.
-6. Reduce the size and responsibility of core-file overlays.
+細節請見 README 各章節。
